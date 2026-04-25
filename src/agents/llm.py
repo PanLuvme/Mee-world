@@ -117,7 +117,28 @@ class LLMClient:
             json=payload,
         )
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        data          = resp.json()
+        choice        = data["choices"][0]
+        content       = (choice["message"]["content"] or "").strip()
+        finish_reason = choice.get("finish_reason", "unknown")
+        usage         = data.get("usage", {})
+        comp_tokens   = usage.get("completion_tokens", "?")
+        prompt_tokens = usage.get("prompt_tokens", "?")
+
+        if finish_reason == "length":
+            logger.warning(
+                f"[LLM] ⚠️  TRUNCATED (finish_reason=length) | "
+                f"model={model} | max_tokens={max_tokens} | "
+                f"completion_tokens={comp_tokens} | prompt_tokens={prompt_tokens} | "
+                f"content_end={repr(content[-40:])}"
+            )
+        else:
+            logger.debug(
+                f"[LLM] finish_reason={finish_reason} | model={model} | "
+                f"completion_tokens={comp_tokens} | prompt_tokens={prompt_tokens}"
+            )
+
+        return content
 
     async def complete(self, messages: list[dict], max_tokens: int = 500,
                        temperature: float = 0.85, json_mode: bool = False,
