@@ -778,13 +778,16 @@ class MeeAgent:
             if unshared:
                 unshared_for[other_name] = unshared
 
-        # Dynamic token budget: shorter for ambient, more for important moments
+        # Dynamic token budget — these are SAFETY CEILINGS, not targets.
+        # The system prompt already instructs 1-2 sentence responses; the ceilings
+        # should be generous enough that the model self-terminates naturally and
+        # never gets hard-truncated mid-sentence.
         if forced or social_target:
-            _max_tokens = 300   # forced summons / social nudges get full range
+            _max_tokens = 500   # summons / social nudges — give full range
         elif pending_addressed:
-            _max_tokens = 250   # room for a proper reply
+            _max_tokens = 400   # direct replies need room to finish a thought
         else:
-            _max_tokens = 180   # ambient organic chat → keep it short
+            _max_tokens = 250   # ambient chat — generous ceiling, prompt keeps it short
 
         # ── FOREGROUND / BACKGROUND routing ───────────────────────────────────
         # FOREGROUND (Gemini): direct user or targeted Mee-to-Mee conversation
