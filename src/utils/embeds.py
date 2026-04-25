@@ -11,7 +11,7 @@ v5 changes:
 import discord
 from datetime import datetime
 
-DEFAULT_IMAGE = "https://i.postimg.cc/cJnwz3qf/Default-Mee.png"
+DEFAULT_IMAGE = "https://i.imgur.com/Ti2OGlU.png"
 
 # Full event type → emoji map (covers v2 through v4 event types)
 EVENT_ICONS = {
