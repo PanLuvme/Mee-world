@@ -70,7 +70,15 @@ async def _check_mee_ownership(interaction: discord.Interaction, mee_name: str) 
 
 
 async def _check_create_permission(interaction: discord.Interaction) -> bool:
-    """Check REQUIRE_ROLE_ID gate and per-user Mee limit."""
+    """Check REQUIRE_ROLE_ID gate and per-user Mee limit.
+
+    The bot owner (OWNER_ID) bypasses both the role gate and the per-user cap
+    so they can create as many Mees as needed for the simulation.
+    """
+    # Bot owner has no restrictions — skip all gates.
+    if interaction.user.id == OWNER_ID:
+        return True
+
     if REQUIRE_ROLE_ID:
         member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
         if not member or not any(str(r.id) == REQUIRE_ROLE_ID for r in member.roles):
