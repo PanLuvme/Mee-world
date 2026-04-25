@@ -30,12 +30,18 @@ logger = logging.getLogger(__name__)
 OWNER_ID          = int(os.getenv("OWNER_ID", "258778043944796161"))
 MAX_MEES_PER_USER = int(os.getenv("MAX_MEES_PER_USER", "1"))
 REQUIRE_ROLE_ID   = os.getenv("REQUIRE_ROLE_ID", "").strip()
-OWNER_API_KEY     = os.getenv("OWNER_API_KEY", "").strip()
-OWNER_API_BASE    = os.getenv("OWNER_API_BASE", "https://api.groq.com/openai/v1").strip()
-OWNER_API_MODEL   = os.getenv("OWNER_API_MODEL", "llama-3.1-8b-instant").strip()
+OWNER_API_KEY          = os.getenv("OWNER_API_KEY", "").strip()
+OWNER_API_BASE         = os.getenv("OWNER_API_BASE", "https://api.groq.com/openai/v1").strip()
+OWNER_API_MODEL        = os.getenv("OWNER_API_MODEL", "llama-3.1-8b-instant").strip()
+
+# ── Foreground (Gemini) server-level fallback ──────────────────────────────────
+# If set, users don't need their own Gemini key — the bot owner provides one.
+OWNER_GEMINI_API_KEY   = os.getenv("OWNER_GEMINI_API_KEY", "").strip()
+OWNER_GEMINI_MODEL     = os.getenv("OWNER_GEMINI_MODEL", "gemini-2.0-flash").strip()
 
 DEFAULT_GROQ_BASE  = "https://api.groq.com/openai/v1"
 DEFAULT_GROQ_MODEL = "llama-3.1-8b-instant"
+GEMINI_API_BASE    = "https://generativelanguage.googleapis.com/v1beta/openai"
 
 
 # ─── Permission helpers ────────────────────────────────────────────────────────
@@ -155,6 +161,8 @@ class AddMeeModal(discord.ui.Modal, title="✨ Create a New Mee (Admin)"):
             traits=traits, goals=goals, model=model, api_key=api_key, api_base=api_base,
             image_url=DEFAULT_IMAGE, channel_id=self.channel_id, webhook_url=webhook_url,
             owner_discord_id="0",   # admin-created Mees owned by server
+            gemini_api_key=OWNER_GEMINI_API_KEY or None,
+            gemini_model=OWNER_GEMINI_MODEL if OWNER_GEMINI_API_KEY else None,
         )
 
         mee   = await db.get_mee_by_id(mee_id)
@@ -222,6 +230,65 @@ class EditModelModal(discord.ui.Modal, title="🤖 Edit LLM Settings"):
             embed=embeds.success_embed(f"**{self.mee_data['name']}**'s LLM updated to `{model}`!"),
             ephemeral=True,
         )
+
+
+class EditForegroundKeyModal(discord.ui.Modal, title="🌟 Foreground Key (Gemini)"):
+    """Set the Google AI Studio API key used for direct user/Mee-to-Mee responses."""
+    fg_key = discord.ui.TextInput(
+        label="Google AI Studio API Key (foreground)",
+        placeholder="AIza... — free at aistudio.google.com — leave blank to clear",
+        max_length=400, required=False,
+    )
+    fg_model = discord.ui.TextInput(
+        label="Gemini model (default: gemini-2.0-flash)",
+        placeholder="gemini-2.0-flash",
+        max_length=100, required=False,
+    )
+
+    def __init__(self, mee_data: dict):
+        super().__init__()
+        self.mee_data             = mee_data
+        self.fg_key.default       = mee_data.get("gemini_api_key") or ""
+        self.fg_model.default     = mee_data.get("gemini_model") or "gemini-2.0-flash"
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        key   = self.fg_key.value.strip()
+        model = self.fg_model.value.strip() or "gemini-2.0-flash"
+
+        if key:
+            # Validate the Gemini key against the OpenAI-compat endpoint
+            valid = await validate_api_key(key, GEMINI_API_BASE, model)
+            if not valid:
+                await interaction.followup.send(
+                    embed=embeds.error_embed(
+                        "❌ Could not validate the Gemini API key.\n\n"
+                        "• Get a **free** key at [aistudio.google.com](https://aistudio.google.com)\n"
+                        "• The key should start with `AIza`\n"
+                        "• Make sure the Gemini API is enabled in your Google account"
+                    ),
+                    ephemeral=True,
+                )
+                return
+            await db.update_mee(self.mee_data["id"], gemini_api_key=key, gemini_model=model)
+            await interaction.followup.send(
+                embed=embeds.success_embed(
+                    f"✅ **{self.mee_data['name']}** will now use Gemini `{model}` "
+                    f"for direct conversations with users and other Mees.\n"
+                    f"Background/idle chat still uses the Groq key."
+                ),
+                ephemeral=True,
+            )
+        else:
+            # Clear the foreground key — fall back to Groq for everything
+            await db.update_mee(self.mee_data["id"], gemini_api_key=None, gemini_model=None)
+            await interaction.followup.send(
+                embed=embeds.success_embed(
+                    f"Foreground key cleared. **{self.mee_data['name']}** "
+                    f"will use the background (Groq) key for all calls."
+                ),
+                ephemeral=True,
+            )
 
 
 class EditImageModal(discord.ui.Modal, title="🖼️ Change Character Image"):
@@ -414,6 +481,8 @@ class CreateMyMeeModal(discord.ui.Modal, title="🌸 Create Your Mee"):
             traits=traits, goals=goals, model=model, api_key=api_key, api_base=api_base,
             image_url=DEFAULT_IMAGE, channel_id=self.channel_id, webhook_url=webhook_url,
             owner_discord_id=str(interaction.user.id),
+            gemini_api_key=OWNER_GEMINI_API_KEY or None,
+            gemini_model=OWNER_GEMINI_MODEL if OWNER_GEMINI_API_KEY else None,
         )
 
         mee   = await db.get_mee_by_id(mee_id)
@@ -454,6 +523,10 @@ class ManageMeeView(discord.ui.View):
     @discord.ui.button(label="📝 Rename", style=discord.ButtonStyle.secondary, row=1)
     async def rename(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(EditNameModal(self.mee))
+
+    @discord.ui.button(label="🌟 Foreground Key", style=discord.ButtonStyle.primary, row=1)
+    async def edit_fg_key(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(EditForegroundKeyModal(self.mee))
 
     @discord.ui.button(label="🧠 Memories", style=discord.ButtonStyle.grey, row=2)
     async def view_memories(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -564,6 +637,10 @@ class UserManageMeeView(discord.ui.View):
     @discord.ui.button(label="🖼️ Image URL", style=discord.ButtonStyle.secondary, row=1)
     async def edit_image(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(EditImageModal(self.mee))
+
+    @discord.ui.button(label="🌟 Foreground Key", style=discord.ButtonStyle.primary, row=1)
+    async def edit_fg_key(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(EditForegroundKeyModal(self.mee))
 
     @discord.ui.button(label="🧹 Reset Memories", style=discord.ButtonStyle.danger, row=2)
     async def clear_user_memories(self, interaction: discord.Interaction, button: discord.ui.Button):

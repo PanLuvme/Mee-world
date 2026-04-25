@@ -20,6 +20,7 @@ from datetime import datetime, timezone, date
 
 from src.agents.llm import (
     LLMClient,
+    GEMINI_API_BASE,
     build_plan_prompt,
     build_action_prompt,
     build_relationship_update_prompt,
@@ -69,6 +70,25 @@ _SENTIMENT_KEYWORDS = frozenset({
     "laugh", "laughing", "scared", "jealous", "proud", "trust", "upset",
     "worried", "excited", "annoyed", "grateful", "thankful",
 })
+
+
+# ─── Foreground LLM builder ────────────────────────────────────────────────────
+
+def _build_fg_client(mee_data: dict, bg_client: LLMClient) -> LLMClient:
+    """
+    Build a foreground LLM client (Gemini) for direct user/Mee-to-Mee responses.
+    Falls back to bg_client (Groq) if no Gemini key is set.
+    Uses Google AI Studio's OpenAI-compatible endpoint — no extra code changes needed.
+    """
+    gemini_key   = mee_data.get("gemini_api_key") or ""
+    gemini_model = mee_data.get("gemini_model") or "gemini-2.0-flash"
+    if not gemini_key:
+        return bg_client
+    return LLMClient(
+        api_key=gemini_key,
+        model=gemini_model,
+        api_base=GEMINI_API_BASE,
+    )
 
 
 # ─── Day rhythm helper ─────────────────────────────────────────────────────────
@@ -129,6 +149,9 @@ class MeeAgent:
             api_base=mee_data.get("api_base", "https://api.groq.com/openai/v1"),
             quality_model=mee_data.get("quality_model"),
         )
+        # Foreground client (Gemini) — used for direct user/Mee-to-Mee responses.
+        # Falls back to self.llm (Groq) when no Gemini key is configured.
+        self.llm_fg = _build_fg_client(mee_data, self.llm)
 
         self._today_plan:       list[str]    = []
         self._plan_date:        str          = ""
@@ -167,6 +190,7 @@ class MeeAgent:
                 api_base=data.get("api_base", "https://api.groq.com/openai/v1"),
                 quality_model=data.get("quality_model"),
             )
+            self.llm_fg = _build_fg_client(data, self.llm)
 
     # ─── Observe ───────────────────────────────────────────────────────────────
 
@@ -493,7 +517,8 @@ class MeeAgent:
         relevant = [m["content"] for m in mems if crush_name in m["content"]][:5]
 
         try:
-            confession = await self.llm.complete_quality(
+            # Confession is direct Mee-to-Mee → use foreground LLM (Gemini)
+            confession = await self.llm_fg.complete_quality(
                 build_confession_prompt(
                     self.name, crush_name,
                     rel["relationship"] if rel else "friend",
@@ -526,7 +551,8 @@ class MeeAgent:
             o_relevant = [m["content"] for m in other_mems if self.name in m["content"]][:5]
 
             try:
-                raw_response = await other_agent.llm.complete_quality(
+                # Confession response is also a direct targeted Mee-to-Mee reply → foreground
+                raw_response = await other_agent.llm_fg.complete_quality(
                     build_confession_response_prompt(
                         other_agent.name, self.name, confession,
                         other_rel["relationship"] if other_rel else "friend",
@@ -760,8 +786,18 @@ class MeeAgent:
         else:
             _max_tokens = 180   # ambient organic chat → keep it short
 
+        # ── FOREGROUND / BACKGROUND routing ───────────────────────────────────
+        # FOREGROUND (Gemini): direct user or targeted Mee-to-Mee conversation
+        # BACKGROUND (Groq):   ambient idle chatter, no specific audience
+        is_foreground = bool(pending_addressed) or forced or bool(social_target)
+        _action_llm   = self.llm_fg if is_foreground else self.llm
+        logger.debug(
+            f"[{self.name}] LLM tier: {'FOREGROUND' if is_foreground else 'BACKGROUND'} "
+            f"({_action_llm.api_base.split('/')[2]})"
+        )
+
         try:
-            response = await self.llm.complete(
+            response = await _action_llm.complete(
                 build_action_prompt(
                     self.name, self.identity, self.traits, self.goals,
                     mem_contents, plan, recent_chat, relationships,

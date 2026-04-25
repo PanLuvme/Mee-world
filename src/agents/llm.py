@@ -21,6 +21,12 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# ─── Provider constants ────────────────────────────────────────────────────────
+
+GROQ_API_BASE   = "https://api.groq.com/openai/v1"
+# Google AI Studio exposes an OpenAI-compatible endpoint; no code changes needed.
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
+
 # ─── Module-level persistent HTTP client ──────────────────────────────────────
 
 _http_client: Optional[httpx.AsyncClient] = None

@@ -84,6 +84,8 @@ async def init_db():
                 quality_model     TEXT    DEFAULT NULL,
                 api_key           TEXT    NOT NULL,
                 api_base          TEXT    NOT NULL DEFAULT 'https://api.groq.com/openai/v1',
+                gemini_api_key    TEXT    DEFAULT NULL,
+                gemini_model      TEXT    DEFAULT NULL,
                 image_url         TEXT    NOT NULL DEFAULT '',
                 channel_id        TEXT,
                 webhook_url       TEXT,
@@ -206,6 +208,8 @@ async def init_db():
             ("mees",          "mood",             "TEXT NOT NULL DEFAULT 'neutral'"),
             ("mees",          "owner_discord_id",  "TEXT NOT NULL DEFAULT '0'"),
             ("mees",          "quality_model",    "TEXT DEFAULT NULL"),
+            ("mees",          "gemini_api_key",   "TEXT DEFAULT NULL"),
+            ("mees",          "gemini_model",     "TEXT DEFAULT NULL"),
             ("relationships", "tier",             "TEXT NOT NULL DEFAULT 'stranger'"),
             ("relationships", "is_estranged",     "INTEGER NOT NULL DEFAULT 0"),
             ("relationships", "crush_on",         "TEXT DEFAULT NULL"),
@@ -224,19 +228,22 @@ async def init_db():
 async def create_mee(name, identity, traits, goals, model, api_key, api_base,
                      image_url, channel_id, webhook_url=None,
                      location="the main channel", owner_discord_id="0",
-                     quality_model=None):
+                     quality_model=None, gemini_api_key=None, gemini_model=None):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("""
             INSERT INTO mees
                 (name, identity, traits, goals, model, quality_model,
-                 api_key, api_base, image_url, channel_id, webhook_url,
+                 api_key, api_base, gemini_api_key, gemini_model,
+                 image_url, channel_id, webhook_url,
                  location, owner_discord_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             name, identity, json.dumps(traits), json.dumps(goals),
             model, quality_model,
-            encrypt_key(api_key), api_base, image_url,
-            channel_id, webhook_url, location, str(owner_discord_id),
+            encrypt_key(api_key), api_base,
+            encrypt_key(gemini_api_key) if gemini_api_key else None,
+            gemini_model,
+            image_url, channel_id, webhook_url, location, str(owner_discord_id),
         ))
         await db.commit()
         return cur.lastrowid
@@ -247,6 +254,8 @@ def _parse_mee(row) -> dict:
     d["traits"]   = json.loads(d["traits"])
     d["goals"]    = json.loads(d["goals"])
     d["api_key"]  = decrypt_key(d["api_key"])
+    if d.get("gemini_api_key"):
+        d["gemini_api_key"] = decrypt_key(d["gemini_api_key"])
     return d
 
 
@@ -301,9 +310,11 @@ async def update_mee(mee_id: int, **kwargs):
     for k in ("traits", "goals"):
         if k in kwargs and isinstance(kwargs[k], list):
             kwargs[k] = json.dumps(kwargs[k])
-    # Encrypt api_key if it's being updated
+    # Encrypt api keys if being updated
     if "api_key" in kwargs and kwargs["api_key"]:
         kwargs["api_key"] = encrypt_key(kwargs["api_key"])
+    if "gemini_api_key" in kwargs and kwargs["gemini_api_key"]:
+        kwargs["gemini_api_key"] = encrypt_key(kwargs["gemini_api_key"])
     fields = ", ".join(f"{k} = ?" for k in kwargs)
     values = list(kwargs.values()) + [mee_id]
     async with aiosqlite.connect(DB_PATH) as db:

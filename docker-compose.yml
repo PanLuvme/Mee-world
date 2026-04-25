@@ -9,6 +9,8 @@ services:
       - OWNER_API_KEY=${OWNER_API_KEY:-}
       - OWNER_API_BASE=${OWNER_API_BASE:-https://api.groq.com/openai/v1}
       - OWNER_API_MODEL=${OWNER_API_MODEL:-llama-3.1-8b-instant}
+      - OWNER_GEMINI_API_KEY=${OWNER_GEMINI_API_KEY:-}
+      - OWNER_GEMINI_MODEL=${OWNER_GEMINI_MODEL:-gemini-2.0-flash}
       - MAX_MEES_PER_USER=${MAX_MEES_PER_USER:-1}
       - REQUIRE_ROLE_ID=${REQUIRE_ROLE_ID:-}
       - TICK_INTERVAL_MIN=${TICK_INTERVAL_MIN:-3}
