@@ -524,7 +524,7 @@ class MeeAgent:
                     rel["relationship"] if rel else "friend",
                     relevant
                 ),
-                max_tokens=200, temperature=0.9,
+                max_tokens=400, temperature=0.9,
             )
             self._charge_budget()
             confession = confession.strip().strip('"') if confession else None
@@ -559,7 +559,7 @@ class MeeAgent:
                         other_rel["sentiment"]    if other_rel else 0.5,
                         o_relevant
                     ),
-                    max_tokens=250, temperature=0.88,
+                    max_tokens=500, temperature=0.88,
                 )
                 other_agent._charge_budget()
                 if raw_response:
