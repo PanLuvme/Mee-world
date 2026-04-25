@@ -102,10 +102,11 @@ class LLMClient:
             "Content-Type":  "application/json",
         }
         payload = {
-            "model":       model,
-            "messages":    messages,
-            "max_tokens":  max_tokens,
-            "temperature": temperature,
+            "model":                model,
+            "messages":             messages,
+            "max_tokens":           max_tokens,   # legacy OpenAI spec (Groq, older Gemini)
+            "max_completion_tokens": max_tokens,  # new OpenAI spec (Gemini compat layer)
+            "temperature":          temperature,
         }
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
