@@ -26,9 +26,9 @@ _collections: dict[int, object] = {}  # mee_id → chroma collection
 # Must sum to 1.0 for the formula to be interpretable
 RETRIEVAL_WEIGHTS = {
     "relevance":  0.40,
-    "importance": 0.30,
-    "recency":    0.20,
-    "rel_boost":  0.10,
+    "importance": 0.32,  # +0.02 — meaningful memories should win over fresh chat
+    "recency":    0.16,  # -0.04 — reduce recency pressure to prevent topic fixation
+    "rel_boost":  0.12,  # +0.02 — relationship-linked memories get a nudge
 }
 
 # Added on top of the weighted sum — keeps values bounded since these are small
@@ -82,6 +82,31 @@ def upsert_memory(mee_id: int, mee_name: str, memory_id: int,
         logger.warning(f"ChromaDB upsert failed for mee {mee_id}: {e}")
 
 
+def delete_memories_from_chroma(mee_id: int, mee_name: str, memory_ids: list):
+    """Remove specific memories from ChromaDB by their SQLite IDs."""
+    if not memory_ids:
+        return
+    try:
+        col = _get_collection(mee_id, mee_name)
+        col.delete(ids=[str(mid) for mid in memory_ids])
+        logger.info(f"Deleted {len(memory_ids)} memories from ChromaDB for {mee_name}")
+    except Exception as e:
+        logger.warning(f"ChromaDB delete failed for mee {mee_id}: {e}")
+
+
+def delete_collection(mee_id: int, mee_name: str):
+    """Delete the entire ChromaDB collection for a Mee (used on full memory wipe)."""
+    try:
+        client    = _get_client()
+        safe_name = "".join(c if c.isalnum() else "_" for c in mee_name)
+        client.delete_collection(name=f"mee_{mee_id}_{safe_name}")
+        if mee_id in _collections:
+            del _collections[mee_id]
+        logger.info(f"Deleted ChromaDB collection for {mee_name}")
+    except Exception as e:
+        logger.warning(f"ChromaDB collection delete failed for {mee_name}: {e}")
+
+
 def query_memories(mee_id: int, mee_name: str, query: str,
                    n_results: int = 30) -> list[dict]:
     """
@@ -119,8 +144,10 @@ def query_memories(mee_id: int, mee_name: str, query: str,
         return []
 
 
-def recency_score(created_at_str: str, decay: float = 0.995) -> float:
-    """Exponential decay based on hours since memory was created. Returns 0–1."""
+def recency_score(created_at_str: str, decay: float = 0.990) -> float:
+    """Exponential decay based on hours since memory was created. Returns 0–1.
+    Lower decay (0.990 vs 0.995) means older memories fade faster, giving
+    less recency penalty pressure — important memories surface over fresh ones."""
     try:
         dt = datetime.fromisoformat(created_at_str)
         if dt.tzinfo is None:

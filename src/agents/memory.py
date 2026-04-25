@@ -10,6 +10,7 @@ v5 changes (Phase 3):
 - Two-stage focal-point reflection retained from v4 (quality model used)
 """
 import logging
+import random
 from datetime import datetime, timedelta, timezone
 
 from src.agents.llm import (
@@ -158,30 +159,58 @@ async def sync_memories_to_chroma(mee_id: int, mee_name: str,
 # ─── HyDE-lite retrieval query ────────────────────────────────────────────────
 
 def build_retrieval_query(mee_name: str, recent_chat: list[dict],
-                           pending_addressed: list[dict] = None) -> str:
+                           pending_addressed: list[dict] = None,
+                           agenda: list[str] = None) -> str:
     """
-    Hypothetical Document Embedding (lite): build a structured first-person
-    memory query rather than concatenating raw chat messages.
+    Diversified retrieval query using THREE sources to prevent topic fixation:
+      1. Last human message / pending addressed (contextual relevance)
+      2. A random older message from recent chat (topic diversity)
+      3. A random agenda item (character-driven, agenda-first)
 
-    Logic:
-    1. If there are pending addressed messages, use the most recent one.
-    2. Otherwise use the last human message in recent_chat.
-    3. Fall back to a Mee-centric generic query.
+    Also has a 20% chance to skip the latest message entirely and query
+    only from the agenda — ensuring the character follows their own plans
+    rather than endlessly reacting to what was last said.
     """
-    focus = ""
+    # 20% chance: ignore recent chat entirely, query from agenda only
+    if (not pending_addressed and agenda
+            and random.random() < 0.20):
+        plan_item = random.choice(agenda)
+        return (
+            f"{mee_name} is thinking about their own plans today: "
+            f"\"{plan_item[:120]}\" — what memories come to mind?"
+        )
 
+    parts = []
+
+    # Source 1: Pending addressed or last human message (contextual)
     if pending_addressed:
         focus = pending_addressed[-1]["content"]
+        parts.append(f"responding to: \"{focus[:180]}\"")
     else:
-        # Prefer the last message from a non-Mee author
         human_msgs = [m for m in recent_chat[-8:] if not m.get("is_mee")]
         if human_msgs:
             focus = human_msgs[-1]["content"]
-        elif recent_chat:
-            focus = recent_chat[-1]["content"]
+            parts.append(f"recent: \"{focus[:150]}\"")
 
-    if focus:
-        return f"{mee_name} remembers something relevant to: {focus[:200]}"
+            # Source 2: Random older different message (diversity)
+            if len(human_msgs) >= 3:
+                older = random.choice(human_msgs[:-1])
+                if older["content"] != focus:
+                    parts.append(f"also thinking about: \"{older['content'][:100]}\"")
+        elif recent_chat:
+            parts.append(f"recent: \"{recent_chat[-1]['content'][:150]}\"")
+
+    # Source 3: Agenda-based (character-driven)
+    if agenda:
+        plan_item = random.choice(agenda)
+        parts.append(f"my plans today: \"{plan_item[:100]}\"")
+
+    if parts:
+        return (
+            f"{mee_name} is thinking about "
+            + " | ".join(parts)
+            + " — what memories come to mind?"
+        )
     return f"{mee_name} thinking about recent events and relationships"
 
 

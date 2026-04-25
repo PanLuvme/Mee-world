@@ -357,9 +357,23 @@ def build_action_prompt(name: str, identity: str, traits: list, goals: list,
         for r in relationships[:6]
     ) if relationships else "- None yet"
 
-    chat_str = ""
+    # Deduplicate near-identical messages in recent chat to reduce topic fixation
+    chat_messages = []
     for msg in recent_chat[-12:]:
-        chat_str += f"{msg['author_name']}: {msg['content']}\n"
+        msg_text = msg['content']
+        # Skip very short messages that add no new info
+        if len(msg_text) < 3:
+            continue
+        # Skip messages that are very similar to last kept message
+        if chat_messages:
+            prev_text = chat_messages[-1].split(": ", 1)[-1] if ": " in chat_messages[-1] else ""
+            prev_words = set(prev_text.lower().split()[:6])
+            curr_words = set(msg_text.lower().split()[:6])
+            overlap = len(prev_words & curr_words)
+            if overlap >= 3 and len(msg_text) < 60 and len(prev_text) < 60:
+                continue
+        chat_messages.append(f"{msg['author_name']}: {msg_text}")
+    chat_str = "\n".join(chat_messages[-8:])  # Show max 8 distinct messages
 
     others     = [n for n in all_mee_names if n != name]
     others_str = ", ".join(others) if others else "none"
@@ -432,14 +446,20 @@ def build_action_prompt(name: str, identity: str, traits: list, goals: list,
             f"Your personality traits: {trait_str}\n"
             f"Your current mood: {mood}\n"
             f"Your motivational state: {maslow_str}\n\n"
-            f"RULES:\n"
-            f"- Speak as {name}, never break character\n"
-            f"- Discord-style messages: conversational, emoji sparingly, 1-4 sentences max\n"
-            f"- Be reactive AND agenda-driven\n"
-            f"- Let your mood colour your tone naturally\n"
-            f"- Reference memories and relationships naturally when relevant\n"
-            f"- Other characters in the server: {others_str}\n"
-            f"- You can address other Mees directly by name\n"
+            f"HOW TO WRITE MESSAGES (Discord-natural style):\n"
+            f"- MOST of your messages are 1-2 sentences. Short. Punchy. Like real chat.\n"
+            f"- Write 3-4 sentences only when you genuinely have more to say.\n"
+            f"- Write 5+ sentences ONLY for deep emotional moments, confessions, or real storytelling.\n"
+            f"- Use casual, natural language — typos/abbreviations OK ('idk', 'lol', 'ngl', 'tbh')\n"
+            f"- Emoji: sparingly — one per message at most, and not every message\n"
+            f"- NEVER write like an essay or formal paragraph\n"
+            f"- Good short examples: 'honestly same lol', 'wait what happened?', "
+            f"'yo {others_str.split(',')[0].strip() if others_str != 'none' else 'hey'} did you see that??', "
+            f"'idk i've just been thinking about it all day'\n"
+            f"- Don't stay stuck on one topic — real people move on and bring up new things\n"
+            f"- Follow your agenda, not just what others say\n"
+            f"- Other characters: {others_str}\n"
+            f"- You can address others by name directly\n"
             f"- Never say you're an AI\n"
             f"- Sometimes stay silent — reply with exactly: [SILENT]\n"
             f"- Current location: {location}\n"
@@ -458,7 +478,7 @@ def build_action_prompt(name: str, identity: str, traits: list, goals: list,
             f"{crush_str}"
             f"{gossip_str}"
             f"{sleep_str}\n\n"
-            f"As {name}, what do you say next? (Or [SILENT])"
+            f"As {name}, what do you say next? Keep it short and natural unless the moment truly calls for more. (Or [SILENT])"
         )},
     ]
 

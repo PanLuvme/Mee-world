@@ -360,6 +360,58 @@ async def get_memories_since(mee_id: int, since_iso: str, limit: int = 300) -> l
         return [{**dict(r), "keywords": json.loads(dict(r)["keywords"])} for r in rows]
 
 
+async def count_memories(mee_id: int) -> int:
+    """Count total memories for a Mee."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM memories WHERE mee_id = ?", (mee_id,)
+        )
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+
+async def delete_all_memories(mee_id: int) -> int:
+    """Delete ALL memories for a Mee. Returns count deleted."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("DELETE FROM memories WHERE mee_id = ?", (mee_id,))
+        await db.commit()
+        return cur.rowcount
+
+
+async def delete_today_memories(mee_id: int) -> int:
+    """Delete memories created today. Returns count deleted."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "DELETE FROM memories WHERE mee_id = ? AND date(created_at) = date('now')",
+            (mee_id,),
+        )
+        await db.commit()
+        return cur.rowcount
+
+
+async def delete_memories_about_person(mee_id: int, person_name: str) -> list:
+    """
+    Delete memories mentioning a specific person (case-insensitive).
+    Returns list of deleted memory IDs for ChromaDB cleanup.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        pattern = f"%{person_name}%"
+        cur = await db.execute(
+            "SELECT id FROM memories WHERE mee_id = ? AND content LIKE ? COLLATE NOCASE",
+            (mee_id, pattern),
+        )
+        rows = await cur.fetchall()
+        ids = [r["id"] for r in rows]
+        if ids:
+            placeholders = ",".join("?" * len(ids))
+            await db.execute(
+                f"DELETE FROM memories WHERE id IN ({placeholders})", ids
+            )
+            await db.commit()
+        return ids
+
+
 async def touch_memories(memory_ids: list[int]):
     """Batch UPDATE last_accessed + access_count for a list of memory IDs."""
     if not memory_ids:

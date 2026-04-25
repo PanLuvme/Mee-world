@@ -339,7 +339,11 @@ class MeeBot(commands.Bot):
             if data.get("channel_id") != channel_id:
                 continue
 
-            asyncio.create_task(agent.observe_conversation(author, content))
+            # Sample-gate: don't obsessively store trivial chat as memories.
+            # Always observe if the Mee is addressed; otherwise 40% for short msgs.
+            is_addressed_here = agent.name.lower() in content.lower()
+            if is_addressed_here or len(content) > 20 or random.random() < 0.40:
+                asyncio.create_task(agent.observe_conversation(author, content))
 
             # Relationship update gate: only fire LLM when message is emotionally meaningful
             if len(content) > 10 and agent._should_update_relationship(content, author):

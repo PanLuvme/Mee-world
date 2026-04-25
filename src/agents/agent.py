@@ -705,13 +705,17 @@ class MeeAgent:
         if not forced and not await self.should_react(recent_chat, pending_addressed, is_sleeping):
             return None
 
-        query         = build_retrieval_query(self.name, recent_chat, pending_addressed)
+        # Fetch plan FIRST so it can inform the retrieval query (agenda diversity)
+        plan           = await self.ensure_plan(all_mee_names)
+
+        query         = build_retrieval_query(
+            self.name, recent_chat, pending_addressed, agenda=plan
+        )
         relevant_mems = await retrieve_memories(
             self.llm, self.id, self.name, query,
             top_k=8, relationships=relationships,
         )
         mem_contents = [m["content"] for m in relevant_mems]
-        plan         = await self.ensure_plan(all_mee_names)
 
         need           = await db.get_todays_need(self.id)
         maslow_tier    = _maslow_tier(self.mood, need)
@@ -720,12 +724,41 @@ class MeeAgent:
         crushes        = await db.get_active_crushes(self.id)
         crush_on       = crushes[0]["crush_on"] if crushes else None
 
+        # ── Topic fatigue check: break fixation loops ──────────────────────────
+        # If the agent has been replying about the same topic as the last human
+        # message multiple times in a row, inject a chance of silence to break out.
+        if not forced and not pending_addressed and recent_chat:
+            human_msgs = [m for m in recent_chat[-5:] if not m.get("is_mee")]
+            if human_msgs:
+                last_human_words = set(human_msgs[-1]["content"].lower().split()[:10])
+                my_recent        = [
+                    m["content"] for m in recent_chat[-5:]
+                    if m.get("is_mee") and m.get("author_name") == self.name
+                ]
+                overlap_count = sum(
+                    1 for m in my_recent
+                    if len(set(m.lower().split()[:10]) & last_human_words) >= 3
+                )
+                if overlap_count >= 2 and random.random() < 0.50:
+                    logger.debug(
+                        f"[{self.name}] Topic fatigue: staying silent to break fixation loop"
+                    )
+                    return None
+
         others       = [n for n in all_mee_names if n != self.name]
         unshared_for = {}
         for other_name in others[:3]:
             unshared = await db.get_unshared_highlights(self.id, other_name, limit=2)
             if unshared:
                 unshared_for[other_name] = unshared
+
+        # Dynamic token budget: shorter for ambient, more for important moments
+        if forced or social_target:
+            _max_tokens = 300   # forced summons / social nudges get full range
+        elif pending_addressed:
+            _max_tokens = 250   # room for a proper reply
+        else:
+            _max_tokens = 180   # ambient organic chat → keep it short
 
         try:
             response = await self.llm.complete(
@@ -743,7 +776,7 @@ class MeeAgent:
                     unshared_for=unshared_for if unshared_for else None,
                     is_sleeping=is_sleeping,
                 ),
-                max_tokens=300,
+                max_tokens=_max_tokens,
                 temperature=0.9,
             )
             self._charge_budget()

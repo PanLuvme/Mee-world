@@ -23,6 +23,7 @@ from src.utils import db, embeds
 from src.utils.embeds import DEFAULT_IMAGE, groq_onboarding_embed
 from src.utils.webhook import get_or_create_webhook
 from src.agents.llm import LLMClient
+from src.agents.vector_store import delete_memories_from_chroma, delete_collection
 
 logger = logging.getLogger(__name__)
 
@@ -497,7 +498,40 @@ class ManageMeeView(discord.ui.View):
             )
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @discord.ui.button(label="🗑️ Remove", style=discord.ButtonStyle.danger, row=3)
+    @discord.ui.button(label="🧹 Clear All Memories", style=discord.ButtonStyle.danger, row=3)
+    async def clear_all_memories(self, interaction: discord.Interaction, button: discord.ui.Button):
+        count = await db.count_memories(self.mee["id"])
+        view  = ConfirmMemoryClearView(self.mee, "all")
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                description=(
+                    f"⚠️ Clear **ALL {count} memories** for **{self.mee['name']}**?\n"
+                    "This will reset their entire memory and ChromaDB vectors. Cannot be undone."
+                ),
+                color=0xFF4444,
+            ),
+            view=view, ephemeral=True,
+        )
+
+    @discord.ui.button(label="📅 Clear Today", style=discord.ButtonStyle.secondary, row=3)
+    async def clear_today_memories(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = ConfirmMemoryClearView(self.mee, "today")
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                description=(
+                    f"Clear **today's memories** for **{self.mee['name']}**?\n"
+                    "Only memories from today will be deleted."
+                ),
+                color=0xFF8800,
+            ),
+            view=view, ephemeral=True,
+        )
+
+    @discord.ui.button(label="👤 Clear Person", style=discord.ButtonStyle.secondary, row=3)
+    async def clear_person_memories(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ClearPersonModal(self.mee))
+
+    @discord.ui.button(label="�️ Remove", style=discord.ButtonStyle.danger, row=4)
     async def remove(self, interaction: discord.Interaction, button: discord.ui.Button):
         view = ConfirmDeleteView(self.mee)
         await interaction.response.send_message(
@@ -531,7 +565,22 @@ class UserManageMeeView(discord.ui.View):
     async def edit_image(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(EditImageModal(self.mee))
 
-    @discord.ui.button(label="🗑️ Delete", style=discord.ButtonStyle.danger, row=2)
+    @discord.ui.button(label="🧹 Reset Memories", style=discord.ButtonStyle.danger, row=2)
+    async def clear_user_memories(self, interaction: discord.Interaction, button: discord.ui.Button):
+        count = await db.count_memories(self.mee["id"])
+        view  = ConfirmMemoryClearView(self.mee, "all")
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                description=(
+                    f"Reset **all {count} memories** for **{self.mee['name']}**?\n"
+                    "Your character will start fresh. This cannot be undone."
+                ),
+                color=0xFF4444,
+            ),
+            view=view, ephemeral=True,
+        )
+
+    @discord.ui.button(label="🗑️ Delete", style=discord.ButtonStyle.danger, row=3)
     async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):
         view = ConfirmDeleteView(self.mee)
         await interaction.response.send_message(
@@ -540,6 +589,82 @@ class UserManageMeeView(discord.ui.View):
                 color=0xFF4444,
             ),
             view=view, ephemeral=True,
+        )
+
+
+class ClearPersonModal(discord.ui.Modal, title="👤 Clear memories about a person"):
+    person_name = discord.ui.TextInput(
+        label="Person's name",
+        placeholder="Name of the person to forget (exact or partial match)",
+        max_length=64,
+        required=True,
+    )
+
+    def __init__(self, mee_data: dict):
+        super().__init__()
+        self.mee = mee_data
+
+    async def on_submit(self, interaction: discord.Interaction):
+        name   = self.person_name.value.strip()
+        ids    = await db.delete_memories_about_person(self.mee["id"], name)
+        count  = len(ids)
+        if ids:
+            delete_memories_from_chroma(self.mee["id"], self.mee["name"], ids)
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                description=(
+                    f"🧹 Cleared **{count}** memory{'s' if count != 1 else ''} mentioning "
+                    f"**{name}** from **{self.mee['name']}**."
+                    if count else
+                    f"No memories mentioning **{name}** were found."
+                ),
+                color=0x00CC88 if count else 0x888888,
+            ),
+            ephemeral=True,
+        )
+
+
+class ConfirmMemoryClearView(discord.ui.View):
+    """Confirmation dialog for memory clearing operations."""
+    def __init__(self, mee_data: dict, clear_type: str):
+        super().__init__(timeout=30)
+        self.mee        = mee_data
+        self.clear_type = clear_type  # "all" | "today"
+
+    @discord.ui.button(label="Yes, clear", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        name = self.mee["name"]
+        mee_id = self.mee["id"]
+
+        if self.clear_type == "all":
+            count = await db.delete_all_memories(mee_id)
+            delete_collection(mee_id, name)
+            desc = f"🧹 Cleared **all {count} memories** for **{name}**. They start fresh."
+        else:  # today
+            count = await db.delete_today_memories(mee_id)
+            # For "today" wipe, re-query ids that were deleted — just purge & re-sync
+            # ChromaDB will naturally lose them on next sync; no IDs to pass
+            try:
+                delete_collection(mee_id, name)
+            except Exception:
+                pass
+            desc = f"📅 Cleared **{count}** of today's memories for **{name}**."
+
+        # Add a soft reset observation so the Mee knows something changed
+        await db.add_memory(
+            mee_id,
+            f"I feel like I've forgotten something... my memories feel hazy.",
+            "observation",
+            importance=4.0,
+        )
+        await interaction.response.edit_message(
+            embed=discord.Embed(description=desc, color=0x00CC88), view=None
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=embeds.success_embed("Cancelled."), view=None
         )
 
 
