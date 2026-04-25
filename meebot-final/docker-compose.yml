@@ -1,0 +1,27 @@
+services:
+  meebot:
+    build: .
+    restart: unless-stopped
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - OWNER_ID=${OWNER_ID:-258778043944796161}
+      - SECRET_KEY=${SECRET_KEY:-}
+      - OWNER_API_KEY=${OWNER_API_KEY:-}
+      - OWNER_API_BASE=${OWNER_API_BASE:-https://api.groq.com/openai/v1}
+      - OWNER_API_MODEL=${OWNER_API_MODEL:-llama-3.1-8b-instant}
+      - MAX_MEES_PER_USER=${MAX_MEES_PER_USER:-1}
+      - REQUIRE_ROLE_ID=${REQUIRE_ROLE_ID:-}
+      - TICK_INTERVAL_MIN=${TICK_INTERVAL_MIN:-3}
+      - SPOKE_COOLDOWN_MIN=${SPOKE_COOLDOWN_MIN:-4}
+      - MAX_CALLS_PER_TICK=${MAX_CALLS_PER_TICK:-8}
+      - SLEEP_HOUR_START=${SLEEP_HOUR_START:-23}
+      - SLEEP_HOUR_END=${SLEEP_HOUR_END:-7}
+      - REFLECTION_THRESHOLD=${REFLECTION_THRESHOLD:-150}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DB_PATH=/data/meebot.db
+    volumes:
+      - meebot_data:/data
+
+volumes:
+  meebot_data:
+    driver: local
