@@ -16,6 +16,7 @@ import logging
 import os
 import random
 import re
+import time
 from datetime import datetime, timezone, date
 
 from src.agents.llm import (
@@ -47,16 +48,17 @@ from src.utils import db
 
 logger = logging.getLogger(__name__)
 
-MAX_CALLS_PER_TICK    = int(os.getenv("MAX_CALLS_PER_TICK", "8"))
-SLEEP_HOUR_START      = int(os.getenv("SLEEP_HOUR_START", "23"))
-SLEEP_HOUR_END        = int(os.getenv("SLEEP_HOUR_END", "7"))
+MAX_CALLS_PER_TICK         = int(os.getenv("MAX_CALLS_PER_TICK", "8"))
+SLEEP_HOUR_START           = int(os.getenv("SLEEP_HOUR_START", "23"))
+SLEEP_HOUR_END             = int(os.getenv("SLEEP_HOUR_END", "7"))
+WANDER_COOLDOWN_MINUTES    = int(os.getenv("WANDER_COOLDOWN_MINUTES", "30"))
 
 DEFAULT_LOCATIONS = [
     "the café", "the park", "the library", "the rooftop", "their room",
     "the garden", "the couch", "the balcony", "the kitchen", "the town square",
 ]
 
-WANDER_CHANCE             = 0.18
+WANDER_CHANCE             = 0.06
 SOCIAL_INITIATIVE_MINUTES = 12
 INTRO_CHANCE_PER_TICK     = 0.04
 NEED_CHANCE_PER_TICK      = 0.10
@@ -153,10 +155,11 @@ class MeeAgent:
         # Falls back to self.llm (Groq) when no Gemini key is configured.
         self.llm_fg = _build_fg_client(mee_data, self.llm)
 
-        self._today_plan:       list[str]    = []
-        self._plan_date:        str          = ""
-        self._chroma_watermark: str | None   = None  # incremental sync watermark
-        self._calls_this_tick:  int          = 0     # call budget counter
+        self._today_plan:        list[str]    = []
+        self._plan_date:         str          = ""
+        self._chroma_watermark:  str | None   = None  # incremental sync watermark
+        self._calls_this_tick:   int          = 0     # call budget counter
+        self._last_wander_time:  float        = 0.0   # unix timestamp of last wander
 
     def _budget_ok(self) -> bool:
         """Returns True if we're within the per-tick LLM call budget."""
@@ -879,6 +882,9 @@ class MeeAgent:
         return event
 
     async def maybe_wander(self, guild_id: str = None) -> str | None:
+        # Enforce wander cooldown — don't flood the channel with movement spam
+        if time.time() - self._last_wander_time < WANDER_COOLDOWN_MINUTES * 60:
+            return None
         if random.random() > WANDER_CHANCE:
             return None
         locations = list(DEFAULT_LOCATIONS)
@@ -889,6 +895,7 @@ class MeeAgent:
         choices = [loc for loc in locations if loc != self.location]
         if not choices:
             return None
+        self._last_wander_time = time.time()
         return await self.move_to(random.choice(choices))
 
     # ─── Social initiative ─────────────────────────────────────────────────────
