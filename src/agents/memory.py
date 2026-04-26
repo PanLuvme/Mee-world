@@ -14,6 +14,7 @@ import random
 from datetime import datetime, timedelta, timezone
 
 from src.agents.llm import (
+    build_conversation_reflection_prompt,
     LLMClient,
     build_importance_prompt,
     build_batch_importance_prompt,
@@ -301,4 +302,32 @@ async def maybe_reflect(llm: LLMClient, mee_id: int, mee_name: str,
         stored.append(reflection)
         logger.info(f"[{mee_name}] 💭 Reflection: {reflection[:80]}")
 
+    return stored
+
+
+async def reflect_on_conversation(
+    llm: LLMClient, mee_id: int, mee_name: str,
+    partner_name: str, conversation_summary: str,
+) -> list[str]:
+    """Trigger an immediate reflection after a conversation ends.
+    Uses the quality (foreground) model for deeper insight.
+    Returns a list of stored reflection strings (typically 1)."""
+    try:
+        result = await llm.complete_json(
+            build_conversation_reflection_prompt(mee_name, partner_name, conversation_summary),
+            max_tokens=300, quality=True,
+        )
+        reflections = result.get("reflections", [])
+    except Exception:
+        reflections = []
+
+    stored = []
+    for reflection in reflections:
+        importance = await score_importance(llm, reflection)
+        importance = max(importance, 7.0)
+        mem_id = await db.add_memory(mee_id, reflection, "reflection", importance)
+        upsert_memory(mee_id, mee_name, mem_id, reflection, importance,
+                       "reflection", datetime.now(timezone.utc).isoformat())
+        stored.append(reflection)
+        logger.info(f"[{mee_name}] 💭 Conversation reflection: {reflection[:80]}")
     return stored

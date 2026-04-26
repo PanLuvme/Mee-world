@@ -11,6 +11,7 @@ from typing import Optional
 from src.agents.llm import (
     LLMClient,
     GEMINI_API_BASE,
+    build_stop_words,
     build_plan_prompt,
     build_action_prompt,
     build_relationship_update_prompt,
@@ -30,6 +31,7 @@ from src.agents.memory import (
     add_observation,
     add_conversation_memory,
     maybe_reflect,
+    reflect_on_conversation,
     sync_memories_to_chroma,
     build_retrieval_query,
 )
@@ -52,6 +54,30 @@ INTRO_CHANCE_PER_TICK     = 0.04
 NEED_CHANCE_PER_TICK      = 0.10
 CONFESSION_CHANCE         = 0.18
 PONDER_CHANCE             = 0.35
+
+# --- Activity System ---
+# Agents perform short, flavourful activities between conversations or wander ticks.
+# Each entry: (description, emoji, min_ticks, max_ticks)
+ACTIVITIES: list[tuple[str, str, int, int]] = [
+    ("reading a book",           "📖", 2, 4),
+    ("daydreaming by the window","🤔", 2, 3),
+    ("writing in their journal", "✍️", 2, 4),
+    ("sketching in a notebook",  "🎨", 3, 5),
+    ("practicing a tune",        "🎵", 2, 4),
+    ("tending to some plants",   "🌱", 2, 3),
+    ("stargazing",               "🌟", 2, 3),
+    ("playing a handheld game",  "🎮", 2, 4),
+    ("sipping tea and watching", "☕", 2, 3),
+    ("organising their space",   "📦", 3, 5),
+]
+ACTIVITY_CHANCE = 0.40  # Probability of starting an activity when idle
+
+# ─── Conversation State Machine ─────────────────────────────────────────────────
+# Formal Mee-to-Mee conversation lifecycle with max messages and timeout,
+# adapted from AI Town's Conversation class.
+CONVERSATION_MAX_MINUTES  = 10  # Max duration of a Mee-to-Mee conversation
+CONVERSATION_MAX_MESSAGES = 8   # Max messages per conversation pair
+
 
 _SENTIMENT_KEYWORDS = frozenset({
     "love", "hate", "angry", "miss", "sorry", "afraid", "happy", "sad",
@@ -129,6 +155,9 @@ class MeeAgent:
         self._exhausted:        bool       = False
         self._exhausted_at:     float      = 0.0
         self._silent_ticks:     int        = 0
+        self._activity: Optional[dict] = None  # {"desc": str, "emoji": str, "ticks_left": int}
+        self._conversation_id: Optional[int] = None  # Active conversation ID, if any
+
 
     def _budget_ok(self) -> bool:
         """True if within the per-tick LLM call budget."""
@@ -136,6 +165,23 @@ class MeeAgent:
 
     def _charge_budget(self, n: int = 1):
         self._calls_this_tick += n
+
+    def _pick_activity(self) -> dict:
+        """Pick a random activity with random duration in ticks."""
+        desc, emoji, min_t, max_t = random.choice(ACTIVITIES)
+        return {
+            "desc":      desc,
+            "emoji":     emoji,
+            "ticks_left": random.randint(min_t, max_t),
+        }
+
+    def _activity_event(self) -> str:
+        """World-update string for the current activity."""
+        if not self._activity:
+            return ""
+        return f"{self._activity['emoji']} {self.name} is {self._activity['desc']} {self.location}."
+
+
 
     async def _ensure_chroma_synced(self) -> None:
         """Incremental ChromaDB sync via watermark for startup."""
@@ -710,6 +756,8 @@ class MeeAgent:
         )
 
         try:
+            # Build stop words to prevent LLM from generating other characters' dialogue
+            _stop_words = build_stop_words(self.name, all_mee_names) if all_mee_names else None
             response = await _action_llm.complete(
                 build_action_prompt(
                     self.name, self.identity, self.traits, self.goals,
@@ -727,6 +775,7 @@ class MeeAgent:
                 ),
                 max_tokens=_max_tokens,
                 temperature=0.9,
+                stop=_stop_words,
             )
             self._charge_budget()
         except Exception as e:
@@ -805,7 +854,8 @@ class MeeAgent:
         return await self.move_to(random.choice(choices))
 
     async def check_social_initiative(self, all_agents: list,
-                                       channel_id: str) -> Optional[str]:
+                                       channel_id: str,
+                                       in_conversation_ids: set[int] = None) -> Optional[str]:
         if len(all_agents) < 2:
             return None
         last_spoke = await db.get_mees_last_spoke(channel_id)
@@ -814,6 +864,8 @@ class MeeAgent:
         for other in all_agents:
             if other.id == self.id:
                 continue
+            if in_conversation_ids and other.id in in_conversation_ids:
+                continue  # Skip agents already in a conversation
             spoke_at = last_spoke.get(other.id)
             if spoke_at:
                 try:
@@ -902,6 +954,80 @@ class MeeAgent:
             if self._budget_ok():
                 await self.maybe_surface_need()
 
+            # ── Activity gate ───────────────────────────────────────────────
+            # If the agent is mid-activity and the tick isn't forced, the agent
+            # stays busy rather than wandering, socialising, or generating new action.
+            if not forced and self._activity is not None:
+                self._activity["ticks_left"] -= 1
+                if self._activity["ticks_left"] > 0:
+                    self._silent_ticks = 0  # activity counts as 'doing something'
+                    activity_event = self._activity_event()
+                    if activity_event:
+                        extra_events.append(("activity", activity_event, self))
+                    # Return early — skip gated phase entirely
+                    return None, None, extra_events
+                else:
+                    # Activity expired — clear it and proceed to gated phase
+                    self._activity = None
+
+
+            # ── Conversation State Machine ───────────────────────────────────
+            # Check if agent is mid-conversation. If so, the agent continues
+            # the exchange rather than wandering or starting new social.
+            conversation_partner = None
+            if not forced:
+                conv = await db.get_active_conversation(self.id)
+                if conv:
+                    now_dt = datetime.now(timezone.utc)
+                    last_msg = datetime.fromisoformat(conv["last_message_at"])
+                    if last_msg.tzinfo is None:
+                        last_msg = last_msg.replace(tzinfo=timezone.utc)
+                    elapsed = (now_dt - last_msg).total_seconds() / 60.0
+                    if elapsed > CONVERSATION_MAX_MINUTES or conv["message_count"] >= CONVERSATION_MAX_MESSAGES:
+                        # Conversation expired — end it
+                        partner_name = conv["agent2_name"] if conv["agent1_id"] == self.id else conv["agent1_name"]
+                        await db.end_conversation(conv["id"])
+                        extra_events.append((
+                            "conversation_end",
+                            f"💬 {self.name}'s conversation with {partner_name} has come to a natural end.",
+                            self
+                        ))
+                        self._conversation_id = None
+                        logger.info(f"[{self.name}] 💬 Conversation with {partner_name} ended (expired)")
+                        # ── Conversation-triggered reflection ──────────────────
+                        # Reflect immediately after a conversation ends using quality model
+                        if self._budget_ok():
+                            try:
+                                conv_mems = await db.get_memories(self.id, limit=5)
+                                conv_summary = " ".join(m["content"] for m in conv_mems[:3]) if conv_mems else ""
+                                await reflect_on_conversation(
+                                    self.llm, self.id, self.name,
+                                    partner_name, conv_summary,
+                                )
+                                self._charge_budget(2)
+                            except Exception as refl_e:
+                                logger.warning(
+                                    f"[{self.name}] Conversation reflection failed: {refl_e}"
+                                )
+                    else:
+                        # Active conversation
+                        self._conversation_id = conv["id"]
+                        partner_name = conv["agent2_name"] if conv["agent1_id"] == self.id else conv["agent1_name"]
+                        # ── Typing-aware coordination ──────────────────────────────
+                        # If this agent spoke last, wait for the other agent to
+                        # respond before speaking again (prevents talking over).
+                        if conv.get("last_spoke_by") == self.id:
+                            logger.info(
+                                f"[{self.name}] 💬 Waiting for {partner_name} to respond "
+                                f"(msg #{conv['message_count'] + 1})"
+                            )
+                        else:
+                            conversation_partner = partner_name
+                            logger.info(
+                                f"[{self.name}] 💬 Continuing conversation with "
+                                f"{conversation_partner} (msg #{conv['message_count'] + 1})"
+                            )
+
             if not forced and self._budget_ok():
                 crush_ponder = await self.maybe_develop_crush(all_mee_names)
                 if crush_ponder:
@@ -918,17 +1044,42 @@ class MeeAgent:
                 if intro_msg:
                     extra_events.append(("intro", intro_msg, self))
 
+            # ── Gated phase: wander, social, action ──────────────────────────
+            # If mid-conversation: skip wander, use partner as social target.
+            # Otherwise: normal wander + social initiative (filter out conversing agents).
             wander_event = None
-            if not forced:
+            if not forced and not conversation_partner:
                 wander_event = await self.maybe_wander(guild_id)
 
-            social_target = None
-            if not forced and all_agents:
-                social_target = await self.check_social_initiative(all_agents, channel_id)
+            social_target = conversation_partner  # None if not in conversation
+            if not forced and all_agents and not conversation_partner:
+                in_conv_ids = await db.get_in_conversation_ids()
+                social_target = await self.check_social_initiative(
+                    all_agents, channel_id, in_conversation_ids=in_conv_ids,
+                )
 
             action = await self.decide_action(
                 channel_id, all_mee_names, forced=forced, social_target=social_target
             )
+
+            # ── Conversation lifecycle (start / update) ─────────────────────
+            if action and social_target:
+                if not conversation_partner and all_agents:
+                    # Agent initiated a new conversation — create it
+                    target_agent = next((a for a in all_agents if a.name == social_target), None)
+                    if target_agent:
+                        conv_id = await db.start_conversation(
+                            self.id, target_agent.id,
+                            self.name, target_agent.name,
+                            channel_id,
+                            last_spoke_by=self.id,
+                        )
+                        self._conversation_id = conv_id
+                        logger.info(f"[{self.name}] 💬 Started conversation with {social_target} (conv #{conv_id})")
+                elif self._conversation_id:
+                    # Continuing an existing conversation — update activity + last speaker
+                    await db.update_conversation_activity(self._conversation_id)
+                    await db.update_conversation_last_spoke(self._conversation_id, self.id)
 
             if action:
                 await db.log_conversation(channel_id, self.name, action,
@@ -961,6 +1112,15 @@ class MeeAgent:
             if self._exhausted and (now_ts - self._exhausted_at) >= EXHAUSTION_WAKE_MINUTES * 60:
                 self._exhausted    = False
                 self._silent_ticks = 0
+
+            # ── Activity start (idle ticks only) ────────────────────────────
+            # If the agent produced no action, didn't wander, and isn't exhausted,
+            # they may start a short flavourful activity for the next tick.
+            if not forced and not action and not wander_event and not self._exhausted and self._activity is None:
+                if random.random() < ACTIVITY_CHANCE:
+                    self._activity = self._pick_activity()
+                    logger.info(f"[{self.name}] 🎭 Started activity: {self._activity['emoji']} {self._activity['desc']} ({self._activity['ticks_left']} ticks)")
+
 
             if confession_msg:
                 crush_rels  = await db.get_active_crushes(self.id)

@@ -248,6 +248,14 @@ class MeeBot(commands.Bot):
                     # Narrative sleep/wake announced as world update (not Mee message)
                     await self.post_world_update(content, channel, event_type="exhaustion")
 
+                elif event_type == "activity":
+                    # Flavourful idle activity posted as world update (not Mee message)
+                    await self.post_world_update(content, channel, event_type="activity")
+
+                elif event_type == "conversation_end":
+                    # Conversation expiry posted as world update
+                    await self.post_world_update(content, channel, event_type="conversation")
+
                 elif event_type in ("crush_ponder", "intro", "confession", "confession_response"):
                     try:
                         await asyncio.sleep(random.uniform(2, 8))

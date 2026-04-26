@@ -15,6 +15,7 @@ import asyncio
 import httpx
 import json
 import logging
+import random
 import time
 from datetime import datetime
 from typing import Optional
@@ -159,7 +160,8 @@ class LLMClient:
 
     async def _complete_once(self, messages: list[dict], max_tokens: int,
                               temperature: float, json_mode: bool,
-                              model_override: str = None) -> str:
+                              model_override: str = None,
+                              stop: Optional[list[str]] = None) -> str:
         model = model_override or self.fast_model
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -174,6 +176,8 @@ class LLMClient:
         }
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
+        if stop:
+            payload["stop"] = stop
 
         client = get_http_client()
         resp   = await client.post(
@@ -209,36 +213,46 @@ class LLMClient:
 
     async def complete(self, messages: list[dict], max_tokens: int = 500,
                        temperature: float = 0.85, json_mode: bool = False,
-                       model_override: str = None) -> str:
+                       model_override: str = None,
+                       stop: Optional[list[str]] = None) -> str:
         """Complete with retry + circuit breaker. Returns '' on circuit open."""
         if self._circuit_is_open():
             logger.debug("[LLM] Circuit open — skipping call")
             return ""
 
-        delay = 1.0
+        # Exponential backoff delays: 1s → 10s → 20s before circuit breaker trips
+        backoffs = [1.0, 10.0, 20.0]
+        max_att  = len(backoffs) + 1  # 4 attempts (original + 3 retries)
         last_exc = None
-        for attempt in range(3):
+        for attempt in range(max_att):
             try:
                 result = await self._complete_once(
-                    messages, max_tokens, temperature, json_mode, model_override
+                    messages, max_tokens, temperature, json_mode, model_override,
+                    stop=stop,
                 )
                 self._on_success()
                 return result
             except httpx.HTTPStatusError as e:
                 last_exc = e
                 status   = e.response.status_code
-                if status in (429, 500, 503) and attempt < 2:
-                    logger.warning(f"[LLM] HTTP {status} — retry {attempt+1}/3 in {delay}s")
-                    await asyncio.sleep(delay)
-                    delay *= 2
+                if status in (429, 500, 503) and attempt < len(backoffs):
+                    jitter = backoffs[attempt] * random.uniform(0.8, 1.2)
+                    logger.warning(
+                        f"[LLM] HTTP {status} — backoff {attempt+1}/{len(backoffs)} "
+                        f"in {jitter:.1f}s"
+                    )
+                    await asyncio.sleep(jitter)
                     continue
                 break
             except (httpx.TimeoutException, httpx.ConnectError) as e:
                 last_exc = e
-                if attempt < 2:
-                    logger.warning(f"[LLM] Timeout/connect error — retry {attempt+1}/3 in {delay}s")
-                    await asyncio.sleep(delay)
-                    delay *= 2
+                if attempt < len(backoffs):
+                    jitter = backoffs[attempt] * random.uniform(0.8, 1.2)
+                    logger.warning(
+                        f"[LLM] Timeout/connect error — backoff {attempt+1}/{len(backoffs)} "
+                        f"in {jitter:.1f}s"
+                    )
+                    await asyncio.sleep(jitter)
                     continue
                 break
             except Exception as e:
@@ -575,6 +589,40 @@ def build_action_prompt(name: str, identity: str, traits: list, goals: list,
             f"As {name}, what do you say next? Keep it short and natural unless the moment truly calls for more. (Or [SILENT])"
         )},
     ]
+
+
+# ── Conversation-triggered reflection ────────────────────────────────────────
+
+def build_conversation_reflection_prompt(
+    name: str, partner_name: str, conversation_summary: str,
+) -> list[dict]:
+    """Generate a reflection prompt triggered by a conversation ending."""
+    return [
+        {"role": "system", "content": (
+            f"You ARE {name}. A conversation you just had with {partner_name} has ended. "
+            "Reflect on what happened — how you feel about it, what it means for you, "
+            "what you learned. Write a single short insight (1-2 sentences) in first-person, "
+            "Discord-casual style, as a private thought. No JSON."
+        )},
+        {"role": "user", "content": (
+            f"Your conversation with {partner_name}:\n"
+            f"{conversation_summary}\n\n"
+            f"What is {name}'s private reflection on this exchange?"
+        )},
+    ]
+
+
+# ── Stop word helpers ─────────────────────────────────────────────────────────
+
+def build_stop_words(speaker_name: str, all_names: list[str]) -> list[str]:
+    """Build stop sequences that prevent the LLM from generating other characters'
+    dialogue or meta-commentary.  Returns e.g. ['Alice:', 'Bob:', '[Alice', '[Bob']."""
+    stops: list[str] = []
+    for n in all_names:
+        if n != speaker_name:
+            stops.append(f"{n}:")
+            stops.append(f"[{n}")
+    return stops
 
 
 # ── Mood / recap / world ──────────────────────────────────────────────────────

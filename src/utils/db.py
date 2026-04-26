@@ -203,17 +203,34 @@ async def init_db():
             )
         """)
 
-        # Migrations for existing databases
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS active_conversations (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent1_id       INTEGER NOT NULL REFERENCES mees(id) ON DELETE CASCADE,
+                agent2_id       INTEGER NOT NULL REFERENCES mees(id) ON DELETE CASCADE,
+                agent1_name     TEXT    NOT NULL,
+                agent2_name     TEXT    NOT NULL,
+                channel_id      TEXT    NOT NULL,
+                created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+                last_message_at TEXT    NOT NULL DEFAULT (datetime('now')),
+                message_count   INTEGER NOT NULL DEFAULT 0,
+                max_messages    INTEGER NOT NULL DEFAULT 8,
+                last_spoke_by   INTEGER DEFAULT NULL
+            )
+        """)
+
+# Migrations for existing databases
         for table, col, coldef in [
-            ("mees",          "mood",             "TEXT NOT NULL DEFAULT 'neutral'"),
-            ("mees",          "owner_discord_id",  "TEXT NOT NULL DEFAULT '0'"),
-            ("mees",          "quality_model",    "TEXT DEFAULT NULL"),
-            ("mees",          "gemini_api_key",   "TEXT DEFAULT NULL"),
-            ("mees",          "gemini_model",     "TEXT DEFAULT NULL"),
-            ("relationships", "tier",             "TEXT NOT NULL DEFAULT 'stranger'"),
-            ("relationships", "is_estranged",     "INTEGER NOT NULL DEFAULT 0"),
-            ("relationships", "crush_on",         "TEXT DEFAULT NULL"),
-            ("relationships", "confession_state", "TEXT NOT NULL DEFAULT 'none'"),
+            ("mees",                  "mood",             "TEXT NOT NULL DEFAULT 'neutral'"),
+            ("mees",                  "owner_discord_id",  "TEXT NOT NULL DEFAULT '0'"),
+            ("mees",                  "quality_model",    "TEXT DEFAULT NULL"),
+            ("mees",                  "gemini_api_key",   "TEXT DEFAULT NULL"),
+            ("mees",                  "gemini_model",     "TEXT DEFAULT NULL"),
+            ("relationships",         "tier",             "TEXT NOT NULL DEFAULT 'stranger'"),
+            ("relationships",         "is_estranged",     "INTEGER NOT NULL DEFAULT 0"),
+            ("relationships",         "crush_on",         "TEXT DEFAULT NULL"),
+            ("relationships",         "confession_state", "TEXT NOT NULL DEFAULT 'none'"),
+            ("active_conversations",  "last_spoke_by",    "INTEGER DEFAULT NULL"),
         ]:
             try:
                 await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coldef}")
@@ -835,3 +852,77 @@ async def get_morning_recap_done(mee_id: int, today: str) -> bool:
             LIMIT 1
         """, (mee_id, today))
         return await cur.fetchone() is not None
+
+
+# ─── Active Conversation State Machine ────────────────────────────────────────────
+
+async def start_conversation(
+    agent1_id: int, agent2_id: int,
+    agent1_name: str, agent2_name: str,
+    channel_id: str, max_messages: int = 8,
+    last_spoke_by: Optional[int] = None,
+) -> int:
+    """Create a new active conversation between two agents. Returns conversation ID."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+            INSERT INTO active_conversations
+                (agent1_id, agent2_id, agent1_name, agent2_name, channel_id, max_messages, last_spoke_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (agent1_id, agent2_id, agent1_name, agent2_name, channel_id, max_messages, last_spoke_by))
+        await db.commit()
+        return cur.lastrowid
+
+
+async def get_active_conversation(agent_id: int) -> Optional[dict]:
+    """Get active conversation for an agent (as either participant). Returns None if none."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("""
+            SELECT * FROM active_conversations
+            WHERE (agent1_id = ? OR agent2_id = ?)
+            LIMIT 1
+        """, (agent_id, agent_id))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def update_conversation_activity(conv_id: int):
+    """Increment message_count and update last_message_at."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            UPDATE active_conversations
+            SET message_count = message_count + 1,
+                last_message_at = datetime('now')
+            WHERE id = ?
+        """, (conv_id,))
+        await db.commit()
+
+
+async def update_conversation_last_spoke(conv_id: int, agent_id: int):
+    """Update which agent spoke last in a conversation (typing-aware coord)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            UPDATE active_conversations
+            SET last_spoke_by = ?
+            WHERE id = ?
+        """, (agent_id, conv_id))
+        await db.commit()
+
+
+async def end_conversation(conv_id: int):
+    """Delete an active conversation."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM active_conversations WHERE id = ?", (conv_id,))
+        await db.commit()
+
+
+async def get_in_conversation_ids() -> set[int]:
+    """Return set of all agent IDs currently in any active conversation."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT agent1_id, agent2_id FROM active_conversations")
+        rows = await cur.fetchall()
+        ids: set[int] = set()
+        for r in rows:
+            ids.add(r[0])
+            ids.add(r[1])
+        return ids
