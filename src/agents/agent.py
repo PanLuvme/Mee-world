@@ -160,6 +160,8 @@ class MeeAgent:
         self._chroma_watermark:  str | None   = None  # incremental sync watermark
         self._calls_this_tick:   int          = 0     # call budget counter
         self._last_wander_time:  float        = 0.0   # unix timestamp of last wander
+        self._exhausted:         bool         = False # LLM exhaustion sleep
+        self._silent_ticks:      int          = 0     # consecutive ticks with no action
 
     def _budget_ok(self) -> bool:
         """Returns True if we're within the per-tick LLM call budget."""
@@ -882,6 +884,9 @@ class MeeAgent:
         return event
 
     async def maybe_wander(self, guild_id: str = None) -> str | None:
+        # Don't wander while exhausted (LLM calls all failing)
+        if self._exhausted:
+            return None
         # Enforce wander cooldown — don't flood the channel with movement spam
         if time.time() - self._last_wander_time < WANDER_COOLDOWN_MINUTES * 60:
             return None
@@ -1060,6 +1065,24 @@ class MeeAgent:
                 await add_observation(self.llm, self.id, f"I said: \"{action}\"",
                                        mee_name=self.name)
                 await db.update_mee(self.id, last_tick=datetime.now(timezone.utc).isoformat())
+
+            # ── Exhaustion sleep / wake ─────────────────────────────────────────
+            # After 3+ consecutive silent ticks (rate-limited, circuit breaker, etc.)
+            # the agent narratively falls asleep. Wakes up when a tick produces action.
+            if action:
+                self._silent_ticks = 0
+                if self._exhausted:
+                    self._exhausted = False
+                    extra_events.append(
+                        ("wake_up", f"☀️ {self.name} has woken up and is back on their feet!", self)
+                    )
+            else:
+                self._silent_ticks += 1
+                if self._silent_ticks >= 3 and not self._exhausted:
+                    self._exhausted = True
+                    extra_events.append(
+                        ("exhausted", f"💤 {self.name} has collapsed from exhaustion and fallen asleep.", self)
+                    )
 
             # Bundle confession events
             if confession_msg:

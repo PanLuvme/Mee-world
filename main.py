@@ -244,6 +244,10 @@ class MeeBot(commands.Bot):
                     except Exception as e:
                         logger.error(f"Morning recap post failed: {e}")
 
+                elif event_type in ("exhausted", "wake_up"):
+                    # Narrative sleep/wake announced as world update (not Mee message)
+                    await self.post_world_update(content, channel, event_type="exhaustion")
+
                 elif event_type in ("crush_ponder", "intro", "confession", "confession_response"):
                     try:
                         await asyncio.sleep(random.uniform(2, 8))
