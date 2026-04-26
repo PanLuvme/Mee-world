@@ -1,23 +1,12 @@
-"""
-Mee Agent v5 — full Tomodachi Life + Smallsville + AgentSociety feature set.
+"""MeeAgent v5 — Tomodachi Life × Smallville × AgentSociety generative agent."""
 
-v5 additions (Phase 4):
-- LLM call budget per tick (MAX_CALLS_PER_TICK env). Gated arcs don't run if budget exhausted.
-- _should_update_relationship() gate: only fires LLM on emotionally meaningful messages
-- Sleep-hour detection: ticks still fire but [SILENT] is nearly guaranteed; recap posts to channel
-- Day rhythm factor: tick interval scaled by time of day for natural Tomodachi/Smallsville pacing
-- morning_recap() now returns (did_recap, recap_text) so main.py can post it to the channel
-- Incremental ChromaDB sync: watermark-based instead of full resync on every restart
-- HyDE-lite retrieval query via memory.build_retrieval_query()
-- quality model used for reflection, confession, crush ponder, plan (Mixture-of-Agents)
-"""
-import asyncio
 import logging
 import os
 import random
 import re
 import time
 from datetime import datetime, timezone, date
+from typing import Optional
 
 from src.agents.llm import (
     LLMClient,
@@ -52,11 +41,10 @@ MAX_CALLS_PER_TICK         = int(os.getenv("MAX_CALLS_PER_TICK", "8"))
 SLEEP_HOUR_START           = int(os.getenv("SLEEP_HOUR_START", "23"))
 SLEEP_HOUR_END             = int(os.getenv("SLEEP_HOUR_END", "7"))
 WANDER_COOLDOWN_MINUTES    = int(os.getenv("WANDER_COOLDOWN_MINUTES", "30"))
+EXHAUSTION_WAKE_MINUTES    = int(os.getenv("EXHAUSTION_WAKE_MINUTES", "5"))
 
-DEFAULT_LOCATIONS = [
-    "the café", "the park", "the library", "the rooftop", "their room",
-    "the garden", "the couch", "the balcony", "the kitchen", "the town square",
-]
+DEFAULT_LOCATIONS = ["the café", "the park", "the library", "the rooftop", "their room",
+                     "the garden", "the couch", "the balcony", "the kitchen", "the town square"]
 
 WANDER_CHANCE             = 0.06
 SOCIAL_INITIATIVE_MINUTES = 12
@@ -65,7 +53,6 @@ NEED_CHANCE_PER_TICK      = 0.10
 CONFESSION_CHANCE         = 0.18
 PONDER_CHANCE             = 0.35
 
-# Keywords that signal emotionally significant messages worth updating a relationship for
 _SENTIMENT_KEYWORDS = frozenset({
     "love", "hate", "angry", "miss", "sorry", "afraid", "happy", "sad",
     "hurt", "wonderful", "terrible", "wonderful", "heart", "cry", "crying",
@@ -74,47 +61,29 @@ _SENTIMENT_KEYWORDS = frozenset({
 })
 
 
-# ─── Foreground LLM builder ────────────────────────────────────────────────────
-
 def _build_fg_client(mee_data: dict, bg_client: LLMClient) -> LLMClient:
-    """
-    Build a foreground LLM client (Gemini) for direct user/Mee-to-Mee responses.
-    Falls back to bg_client (Groq) if no Gemini key is set.
-    Uses Google AI Studio's OpenAI-compatible endpoint — no extra code changes needed.
-    """
+    """Build Gemini foreground client; falls back to Groq if no Gemini key configured."""
     gemini_key   = mee_data.get("gemini_api_key") or ""
     gemini_model = mee_data.get("gemini_model") or "gemini-2.0-flash"
     if not gemini_key:
         return bg_client
-    return LLMClient(
-        api_key=gemini_key,
-        model=gemini_model,
-        api_base=GEMINI_API_BASE,
-    )
+    return LLMClient(api_key=gemini_key, model=gemini_model, api_base=GEMINI_API_BASE)
 
-
-# ─── Day rhythm helper ─────────────────────────────────────────────────────────
 
 def _day_rhythm_factor(hour: int) -> float:
-    """
-    Returns a multiplier for the tick interval based on time of day.
-    Lower = more frequent posts. Higher = less frequent.
-    Sleep hours (SLEEP_HOUR_START to SLEEP_HOUR_END) handled separately.
-    """
+    """Tick-interval multiplier by time-of-day. Sleep hours handled upstream."""
     if _is_sleep_hour(SLEEP_HOUR_START, SLEEP_HOUR_END):
-        return 8.0   # Very sparse during sleep hours (~1 post per 24 min at 3 min base)
-    if 7  <= hour < 9:   return 1.1   # Waking up
-    if 9  <= hour < 12:  return 0.95  # Morning active
-    if 12 <= hour < 14:  return 0.85  # Lunch social burst
-    if 14 <= hour < 17:  return 1.25  # Afternoon lull
-    if 17 <= hour < 19:  return 0.90  # Early evening
-    if 19 <= hour < 22:  return 0.70  # Peak social evening (Tomodachi prime time)
-    return 1.50                        # Late night wind-down (10pm-sleep)
+        return 8.0
+    if 7  <= hour < 9:   return 1.1
+    if 9  <= hour < 12:  return 0.95
+    if 12 <= hour < 14:  return 0.85
+    if 14 <= hour < 17:  return 1.25
+    if 17 <= hour < 19:  return 0.90
+    if 19 <= hour < 22:  return 0.70
+    return 1.50
 
 
-# ─── Maslow tier helper ────────────────────────────────────────────────────────
-
-def _maslow_tier(mood: str, need: dict = None) -> str:
+def _maslow_tier(mood: str, need: Optional[dict] = None) -> str:
     if need:
         need_type = need.get("need_type", "")
         if need_type in ("expressive", "restless"):
@@ -133,7 +102,9 @@ def _maslow_tier(mood: str, need: dict = None) -> str:
 
 
 class MeeAgent:
-    def __init__(self, mee_data: dict):
+    """Generative agent with LLM-driven autonomy, social arcs, memory, and daily rhythm."""
+
+    def __init__(self, mee_data: dict) -> None:
         self.id:          int  = mee_data["id"]
         self.name:        str  = mee_data["name"]
         self.identity:    str  = mee_data["identity"]
@@ -145,84 +116,67 @@ class MeeAgent:
         self.location:    str  = mee_data.get("location") or "the main channel"
         self.mood:        str  = mee_data.get("mood") or "neutral"
 
-        self.llm = LLMClient(
-            api_key=mee_data["api_key"],
-            model=mee_data["model"],
-            api_base=mee_data.get("api_base", "https://api.groq.com/openai/v1"),
-            quality_model=mee_data.get("quality_model"),
-        )
-        # Foreground client (Gemini) — used for direct user/Mee-to-Mee responses.
-        # Falls back to self.llm (Groq) when no Gemini key is configured.
+        self.llm = LLMClient(api_key=mee_data["api_key"], model=mee_data["model"],
+                             api_base=mee_data.get("api_base", "https://api.groq.com/openai/v1"),
+                             quality_model=mee_data.get("quality_model"))
         self.llm_fg = _build_fg_client(mee_data, self.llm)
 
-        self._today_plan:        list[str]    = []
-        self._plan_date:         str          = ""
-        self._chroma_watermark:  str | None   = None  # incremental sync watermark
-        self._calls_this_tick:   int          = 0     # call budget counter
-        self._last_wander_time:  float        = 0.0   # unix timestamp of last wander
-        self._exhausted:         bool         = False # LLM exhaustion sleep
-        self._silent_ticks:      int          = 0     # consecutive ticks with no action
+        self._today_plan:       list[str]  = []
+        self._plan_date:        str        = ""
+        self._chroma_watermark: str | None = None
+        self._calls_this_tick:  int        = 0
+        self._last_wander_time: float      = 0.0
+        self._exhausted:        bool       = False
+        self._exhausted_at:     float      = 0.0
+        self._silent_ticks:     int        = 0
 
     def _budget_ok(self) -> bool:
-        """Returns True if we're within the per-tick LLM call budget."""
+        """True if within the per-tick LLM call budget."""
         return self._calls_this_tick < MAX_CALLS_PER_TICK
 
     def _charge_budget(self, n: int = 1):
         self._calls_this_tick += n
 
-    async def _ensure_chroma_synced(self):
-        """Incremental ChromaDB sync: only newer-than-watermark memories on startup."""
+    async def _ensure_chroma_synced(self) -> None:
+        """Incremental ChromaDB sync via watermark for startup."""
         watermark = await sync_memories_to_chroma(
             self.id, self.name, since_iso=self._chroma_watermark
         )
         self._chroma_watermark = watermark
 
-    async def reload(self):
+    async def reload(self) -> None:
         data = await db.get_mee_by_id(self.id)
-        if data:
-            self.name        = data["name"]
-            self.identity    = data["identity"]
-            self.traits      = data["traits"]
-            self.goals       = data["goals"]
-            self.image_url   = data["image_url"]
-            self.channel_id  = data["channel_id"]
-            self.webhook_url = data.get("webhook_url") or ""
-            self.location    = data.get("location") or "the main channel"
-            self.mood        = data.get("mood") or "neutral"
-            self.llm = LLMClient(
-                api_key=data["api_key"],
-                model=data["model"],
-                api_base=data.get("api_base", "https://api.groq.com/openai/v1"),
-                quality_model=data.get("quality_model"),
-            )
-            self.llm_fg = _build_fg_client(data, self.llm)
+        if not data:
+            return
+        self.name        = data["name"]
+        self.identity    = data["identity"]
+        self.traits      = data["traits"]
+        self.goals       = data["goals"]
+        self.image_url   = data["image_url"]
+        self.channel_id  = data["channel_id"]
+        self.webhook_url = data.get("webhook_url") or ""
+        self.location    = data.get("location") or "the main channel"
+        self.mood        = data.get("mood") or "neutral"
+        self.llm = LLMClient(api_key=data["api_key"], model=data["model"],
+                             api_base=data.get("api_base", "https://api.groq.com/openai/v1"),
+                             quality_model=data.get("quality_model"))
+        self.llm_fg = _build_fg_client(data, self.llm)
 
-    # ─── Observe ───────────────────────────────────────────────────────────────
-
-    async def observe(self, event: str):
+    async def observe(self, event: str) -> None:
         await add_observation(self.llm, self.id, event, mee_name=self.name)
 
-    async def observe_conversation(self, author: str, content: str):
-        mem = f"{author} said: \"{content}\""
-        await add_conversation_memory(self.llm, self.id, mem, mee_name=self.name)
-
-    # ─── Relationship update gate ──────────────────────────────────────────────
+    async def observe_conversation(self, author: str, content: str) -> None:
+        await add_conversation_memory(self.llm, self.id,
+                                      f"{author} said: \"{content}\"", mee_name=self.name)
 
     def _should_update_relationship(self, content: str, other_name: str) -> bool:
-        """
-        Gate: only fire an LLM relationship update when the message is meaningful.
-        Prevents burning rate-limit on every trivial message.
-        """
+        """Gate: only fire LLM relationship updates on emotionally meaningful messages."""
         lowered = content.lower()
-        if other_name.lower() in lowered:
-            return True
-        if self.name.lower() in lowered:
+        if other_name.lower() in lowered or self.name.lower() in lowered:
             return True
         if any(w in lowered for w in _SENTIMENT_KEYWORDS):
             return True
-        return random.random() < 0.15   # 15% ambient drift
-
-    # ─── Plan ──────────────────────────────────────────────────────────────────
+        return random.random() < 0.15
 
     async def ensure_plan(self, all_mee_names: list[str]) -> list[str]:
         today = date.today().isoformat()
@@ -262,32 +216,23 @@ class MeeAgent:
         self._plan_date  = today
         return agenda
 
-    # ─── Reflect ───────────────────────────────────────────────────────────────
-
     async def maybe_reflect(self, all_mee_names: list[str]) -> list[str]:
+        """Two-stage reflection (~3-5 LLM calls); charge budget accordingly."""
         reflections = await maybe_reflect(self.llm, self.id, self.name, all_mee_names)
-        # Two-stage: ~3-5 LLM calls; charge budget accordingly
         if reflections:
             self._charge_budget(min(5, len(reflections) + 2))
         return reflections
-
-    # ─── Relationship tier transitions ─────────────────────────────────────────
 
     async def check_tier_transition(self, other_name: str) -> str | None:
         rel = await db.get_relationship_with(self.id, other_name)
         if not rel:
             return None
-
-        new_tier = db.compute_tier_from_sentiment(
-            rel["sentiment"], rel["tier"], bool(rel.get("is_estranged"))
-        )
+        new_tier = db.compute_tier_from_sentiment(rel["sentiment"], rel["tier"],
+                                                  bool(rel.get("is_estranged")))
         if not new_tier:
             return None
-
-        await db.upsert_relationship(
-            self.id, other_name, rel["relationship"], rel["sentiment"],
-            tier=new_tier
-        )
+        await db.upsert_relationship(self.id, other_name, rel["relationship"], rel["sentiment"],
+                                     tier=new_tier)
         tier_labels = {
             "acquaintance": f"{self.name} and {other_name} have gotten to know each other.",
             "friend":       f"{self.name} and {other_name} have become friends! 🌱",
@@ -296,24 +241,17 @@ class MeeAgent:
         }
         event_text = tier_labels.get(new_tier,
                      f"{self.name} and {other_name}'s relationship has deepened.")
-
         await db.add_world_event("relationship", event_text)
-        await db.add_memory(
-            self.id,
+        await db.add_memory(self.id,
             f"I feel like {other_name} and I have become {new_tier.replace('_', ' ')}s. Something shifted.",
-            "reflection", importance=8.0
-        )
+            "reflection", importance=8.0)
         other_mee = await db.get_mee(other_name)
         if other_mee:
-            await db.add_memory(
-                other_mee["id"],
+            await db.add_memory(other_mee["id"],
                 f"I think {self.name} and I have genuinely become {new_tier.replace('_', ' ')}s.",
-                "reflection", importance=8.0
-            )
+                "reflection", importance=8.0)
         logger.info(f"[{self.name}] 💞 Tier → {new_tier} with {other_name}")
         return event_text
-
-    # ─── Fight detection → estrangement ───────────────────────────────────────
 
     async def check_fight(self, other_name: str, interaction: str) -> bool:
         rel = await db.get_relationship_with(self.id, other_name)
@@ -321,32 +259,24 @@ class MeeAgent:
             return False
         if rel.get("is_estranged"):
             return False
-
         try:
             result   = await self.llm.complete_json(
                 build_fight_check_prompt(self.name, other_name, interaction, rel["sentiment"]),
-                max_tokens=120,
-            )
+                max_tokens=120)
             self._charge_budget()
             is_fight = result.get("is_fight", False)
         except Exception:
             is_fight = False
-
         if not is_fight:
             return False
-
-        await db.upsert_relationship(
-            self.id, other_name, rel["relationship"], rel["sentiment"], is_estranged=True
-        )
+        await db.upsert_relationship(self.id, other_name, rel["relationship"], rel["sentiment"],
+                                     is_estranged=True)
         other_mee = await db.get_mee(other_name)
         if other_mee:
             other_rel = await db.get_relationship_with(other_mee["id"], self.name)
             if other_rel:
-                await db.upsert_relationship(
-                    other_mee["id"], self.name, other_rel["relationship"],
-                    other_rel["sentiment"], is_estranged=True
-                )
-
+                await db.upsert_relationship(other_mee["id"], self.name, other_rel["relationship"],
+                                             other_rel["sentiment"], is_estranged=True)
         event = f"⚡ {self.name} and {other_name} had a falling out. Things are cold between them."
         await db.add_world_event("fight", event)
         await db.add_memory(self.id,
@@ -359,8 +289,6 @@ class MeeAgent:
 
         logger.info(f"[{self.name}] ⚡ Fight with {other_name} → estranged")
         return True
-
-    # ─── Reconciliation ────────────────────────────────────────────────────────
 
     async def check_reconciliation(self, other_name: str, interaction: str) -> bool:
         rel = await db.get_relationship_with(self.id, other_name)
@@ -405,8 +333,6 @@ class MeeAgent:
 
         logger.info(f"[{self.name}] 💚 Reconciled with {other_name}")
         return True
-
-    # ─── Update relationships ──────────────────────────────────────────────────
 
     async def update_relationship(self, other_name: str, interaction: str) -> str | None:
         relationships = await db.get_relationships(self.id)
@@ -454,8 +380,6 @@ class MeeAgent:
 
         return world_event
 
-    # ─── Crush / confession arc ────────────────────────────────────────────────
-
     async def maybe_develop_crush(self, all_mee_names: list[str]) -> str | None:
         if not self._budget_ok():
             return None
@@ -499,7 +423,7 @@ class MeeAgent:
         logger.info(f"[{self.name}] 💓 Developed crush on {crush_name}")
         return msg
 
-    async def maybe_confess(self, channel_id: str, all_agents: list) -> tuple[str | None, str | None]:
+    async def maybe_confess(self, channel_id: str, all_agents: list) -> tuple[Optional[str], Optional[str]]:
         if not self._budget_ok():
             return None, None
         active_crushes = await db.get_active_crushes(self.id)
@@ -624,8 +548,6 @@ class MeeAgent:
 
         return confession, response_msg
 
-    # ─── Third-party introduction ──────────────────────────────────────────────
-
     async def maybe_introduce(self, all_agents: list) -> str | None:
         if not self._budget_ok():
             return None
@@ -674,8 +596,6 @@ class MeeAgent:
         logger.info(f"[{self.name}] 🤝 Introduced {a['other_name']} and {b['other_name']}")
         return msg
 
-    # ─── Daily need surfacing ──────────────────────────────────────────────────
-
     async def maybe_surface_need(self) -> dict | None:
         if not self._budget_ok():
             return None
@@ -705,8 +625,6 @@ class MeeAgent:
         logger.info(f"[{self.name}] 🫀 Need → {need_type} (target: {target_name})")
         return need
 
-    # ─── React-or-continue gate ───────────────────────────────────────────────
-
     async def should_react(self, recent_chat: list[dict],
                             pending_addressed: list[dict],
                             is_sleeping: bool = False) -> bool:
@@ -719,11 +637,9 @@ class MeeAgent:
             return random.random() < 0.60
         return random.random() < 0.40
 
-    # ─── Decide action ─────────────────────────────────────────────────────────
-
     async def decide_action(self, channel_id: str, all_mee_names: list[str],
                              forced: bool = False,
-                             social_target: str = None) -> str | None:
+                             social_target: Optional[str] = None) -> Optional[str]:
         await self._ensure_chroma_synced()
 
         recent_chat       = await db.get_recent_conversations(channel_id, limit=15)
@@ -736,8 +652,7 @@ class MeeAgent:
         if not forced and not await self.should_react(recent_chat, pending_addressed, is_sleeping):
             return None
 
-        # Fetch plan FIRST so it can inform the retrieval query (agenda diversity)
-        plan           = await self.ensure_plan(all_mee_names)
+        plan = await self.ensure_plan(all_mee_names)
 
         query         = build_retrieval_query(
             self.name, recent_chat, pending_addressed, agenda=plan
@@ -755,9 +670,6 @@ class MeeAgent:
         crushes        = await db.get_active_crushes(self.id)
         crush_on       = crushes[0]["crush_on"] if crushes else None
 
-        # ── Topic fatigue check: break fixation loops ──────────────────────────
-        # If the agent has been replying about the same topic as the last human
-        # message multiple times in a row, inject a chance of silence to break out.
         if not forced and not pending_addressed and recent_chat:
             human_msgs = [m for m in recent_chat[-5:] if not m.get("is_mee")]
             if human_msgs:
@@ -783,20 +695,13 @@ class MeeAgent:
             if unshared:
                 unshared_for[other_name] = unshared
 
-        # Dynamic token budget — these are SAFETY CEILINGS, not targets.
-        # The system prompt already instructs 1-2 sentence responses; the ceilings
-        # should be generous enough that the model self-terminates naturally and
-        # never gets hard-truncated mid-sentence.
         if forced or social_target:
-            _max_tokens = 500   # summons / social nudges — give full range
+            _max_tokens = 500
         elif pending_addressed:
-            _max_tokens = 400   # direct replies need room to finish a thought
+            _max_tokens = 400
         else:
-            _max_tokens = 250   # ambient chat — generous ceiling, prompt keeps it short
+            _max_tokens = 250
 
-        # ── FOREGROUND / BACKGROUND routing ───────────────────────────────────
-        # FOREGROUND (Gemini): direct user or targeted Mee-to-Mee conversation
-        # BACKGROUND (Groq):   ambient idle chatter, no specific audience
         is_foreground = bool(pending_addressed) or forced or bool(social_target)
         _action_llm   = self.llm_fg if is_foreground else self.llm
         logger.debug(
@@ -872,8 +777,6 @@ class MeeAgent:
                 if other_mee:
                     await db.enqueue_addressed(other_mee["id"], self.name, message)
 
-    # ─── Location ──────────────────────────────────────────────────────────────
-
     async def move_to(self, new_location: str) -> str:
         old_location  = self.location
         self.location = new_location
@@ -883,11 +786,9 @@ class MeeAgent:
         await self.observe(event)
         return event
 
-    async def maybe_wander(self, guild_id: str = None) -> str | None:
-        # Don't wander while exhausted (LLM calls all failing)
+    async def maybe_wander(self, guild_id: Optional[str] = None) -> Optional[str]:
         if self._exhausted:
             return None
-        # Enforce wander cooldown — don't flood the channel with movement spam
         if time.time() - self._last_wander_time < WANDER_COOLDOWN_MINUTES * 60:
             return None
         if random.random() > WANDER_CHANCE:
@@ -903,10 +804,8 @@ class MeeAgent:
         self._last_wander_time = time.time()
         return await self.move_to(random.choice(choices))
 
-    # ─── Social initiative ─────────────────────────────────────────────────────
-
     async def check_social_initiative(self, all_agents: list,
-                                       channel_id: str) -> str | None:
+                                       channel_id: str) -> Optional[str]:
         if len(all_agents) < 2:
             return None
         last_spoke = await db.get_mees_last_spoke(channel_id)
@@ -934,14 +833,8 @@ class MeeAgent:
         candidates.sort(key=lambda x: -x[1])
         return candidates[0][0].name
 
-    # ─── Morning recap ─────────────────────────────────────────────────────────
-
-    async def morning_recap(self) -> tuple[bool, str | None]:
-        """
-        Returns (did_recap: bool, recap_text: str | None).
-        recap_text is non-None when a new recap was generated —
-        main.py posts it to the channel as a 'waking up' message.
-        """
+    async def morning_recap(self) -> tuple[bool, Optional[str]]:
+        """(did_recap, recap_text). recap_text is None when already done today."""
         today = date.today().isoformat()
         if await db.get_morning_recap_done(self.id, today):
             return False, None
@@ -965,9 +858,7 @@ class MeeAgent:
         logger.info(f"[{self.name}] 🌅 Morning recap: {recap[:80]}")
         return True, recap
 
-    # ─── Mood update ───────────────────────────────────────────────────────────
-
-    async def update_mood(self, reflections: list[str]):
+    async def update_mood(self, reflections: list[str]) -> None:
         if not reflections:
             return
         try:
@@ -984,21 +875,10 @@ class MeeAgent:
         except Exception as e:
             logger.warning(f"[{self.name}] Mood update failed: {e}")
 
-    # ─── Full tick ─────────────────────────────────────────────────────────────
-
     async def tick(self, channel_id: str, all_mee_names: list[str],
-                   all_agents: list = None, forced: bool = False,
-                   guild_id: str = None) -> tuple:
-        """
-        Returns (action: str | None, wander_event: str | None, extra_events: list).
-
-        extra_events items: (event_type: str, content: str, poster_agent: MeeAgent)
-        event_types: "morning_recap", "crush_ponder", "intro", "confession", "confession_response"
-
-        Tick is split into ALWAYS and GATED sections.
-        ALWAYS: morning_recap, reflection, action
-        GATED: need surfacing, crush, confession, intro (require budget headroom)
-        """
+                   all_agents: Optional[list] = None, forced: bool = False,
+                   guild_id: Optional[str] = None) -> tuple[Optional[str], Optional[str], list]:
+        """Returns (action, wander_event, extra_events). Tick split into ALWAYS and GATED phases."""
         try:
             await self.reload()
             self._calls_this_tick = 0   # reset budget for this tick
@@ -1009,52 +889,43 @@ class MeeAgent:
 
             extra_events = []
 
-            # ── ALWAYS: Morning recap ──────────────────────────────────────────
             did_recap, recap_text = await self.morning_recap()
             if did_recap and recap_text:
                 extra_events.append(("morning_recap", recap_text, self))
 
-            # ── ALWAYS: Reflection (may update mood) ──────────────────────────
             reflections = await self.maybe_reflect(all_mee_names)
             for r in reflections:
                 logger.info(f"[{self.name}] 💭 {r[:80]}")
             if reflections:
                 await self.update_mood(reflections)
 
-            # ── GATED: Daily need surfacing ───────────────────────────────────
             if self._budget_ok():
                 await self.maybe_surface_need()
 
-            # ── GATED: Crush development ──────────────────────────────────────
             if not forced and self._budget_ok():
                 crush_ponder = await self.maybe_develop_crush(all_mee_names)
                 if crush_ponder:
                     extra_events.append(("crush_ponder", crush_ponder, self))
 
-            # ── GATED: Confession arc ─────────────────────────────────────────
             confession_msg, confession_response = None, None
             if not forced and all_agents and self._budget_ok():
                 confession_msg, confession_response = await self.maybe_confess(
                     channel_id, all_agents
                 )
 
-            # ── GATED: Third-party introduction ───────────────────────────────
             if not forced and all_agents and self._budget_ok():
                 intro_msg = await self.maybe_introduce(all_agents)
                 if intro_msg:
                     extra_events.append(("intro", intro_msg, self))
 
-            # ── Autonomous wander ──────────────────────────────────────────────
             wander_event = None
             if not forced:
                 wander_event = await self.maybe_wander(guild_id)
 
-            # ── Social initiative ──────────────────────────────────────────────
             social_target = None
             if not forced and all_agents:
                 social_target = await self.check_social_initiative(all_agents, channel_id)
 
-            # ── ALWAYS: Decide action ─────────────────────────────────────────
             action = await self.decide_action(
                 channel_id, all_mee_names, forced=forced, social_target=social_target
             )
@@ -1066,9 +937,13 @@ class MeeAgent:
                                        mee_name=self.name)
                 await db.update_mee(self.id, last_tick=datetime.now(timezone.utc).isoformat())
 
-            # ── Exhaustion sleep / wake ─────────────────────────────────────────
-            # After 3+ consecutive silent ticks (rate-limited, circuit breaker, etc.)
-            # the agent narratively falls asleep. Wakes up when a tick produces action.
+            now_ts = time.time()
+            if self._exhausted and (now_ts - self._exhausted_at) >= EXHAUSTION_WAKE_MINUTES * 60:
+                self._exhausted    = False
+                self._silent_ticks = 0
+                extra_events.append(
+                    ("wake_up", f"☀️ {self.name} has woken up refreshed and is ready to go!", self)
+                )
             if action:
                 self._silent_ticks = 0
                 if self._exhausted:
@@ -1079,12 +954,12 @@ class MeeAgent:
             else:
                 self._silent_ticks += 1
                 if self._silent_ticks >= 3 and not self._exhausted:
-                    self._exhausted = True
+                    self._exhausted    = True
+                    self._exhausted_at = now_ts
                     extra_events.append(
                         ("exhausted", f"💤 {self.name} has collapsed from exhaustion and fallen asleep.", self)
                     )
 
-            # Bundle confession events
             if confession_msg:
                 crush_rels  = await db.get_active_crushes(self.id)
                 crush_name  = crush_rels[0]["crush_on"] if crush_rels else None
