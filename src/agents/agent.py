@@ -938,12 +938,7 @@ class MeeAgent:
                 await db.update_mee(self.id, last_tick=datetime.now(timezone.utc).isoformat())
 
             now_ts = time.time()
-            if self._exhausted and (now_ts - self._exhausted_at) >= EXHAUSTION_WAKE_MINUTES * 60:
-                self._exhausted    = False
-                self._silent_ticks = 0
-                extra_events.append(
-                    ("wake_up", f"☀️ {self.name} has woken up refreshed and is ready to go!", self)
-                )
+            # Natural wake: agent produced action — announce it
             if action:
                 self._silent_ticks = 0
                 if self._exhausted:
@@ -959,6 +954,13 @@ class MeeAgent:
                     extra_events.append(
                         ("exhausted", f"💤 {self.name} has collapsed from exhaustion and fallen asleep.", self)
                     )
+
+            # Silent auto-wake: time-based reset with NO world update.
+            # Prevents oscillation where auto-wake posts "woken up" every 5 min
+            # but agent is still rate-limited and immediately falls back asleep.
+            if self._exhausted and (now_ts - self._exhausted_at) >= EXHAUSTION_WAKE_MINUTES * 60:
+                self._exhausted    = False
+                self._silent_ticks = 0
 
             if confession_msg:
                 crush_rels  = await db.get_active_crushes(self.id)

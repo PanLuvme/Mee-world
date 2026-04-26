@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Environment
+.env
+venv/
+.venv/
+
+# Runtime data (SQLite databases)
+data/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# External reference projects
+ai-town-reference/
+
+# Coverage / testing
+.coverage
+htmlcov/
