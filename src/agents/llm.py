@@ -66,6 +66,17 @@ class LLMClient:
         self._consecutive_failures: int   = 0
         self._circuit_open_until:   float = 0.0
 
+        # Rate limit tracking (populated from API response headers)
+        self._rate_limits: dict = {
+            "remaining_tokens":     None,
+            "remaining_requests":   None,
+            "limit_tokens":         None,
+            "limit_requests":       None,
+            "reset_tokens_sec":     None,   # seconds until token quota resets
+            "reset_requests_sec":   None,   # seconds until request quota resets
+            "last_updated":         None,   # ISO timestamp
+        }
+
     @property
     def model(self) -> str:
         """The primary (fast) model — used as attribute for backward compat."""
@@ -93,6 +104,59 @@ class LLMClient:
                 f"— pausing LLM calls for 5 minutes."
             )
 
+    def _capture_rate_limits(self, headers):
+        """Parse Groq/OpenAI rate-limit headers and store them."""
+        def _parse_duration(dur: str) -> int | None:
+            """Parse '2h23m15s' into total seconds. Returns None on failure."""
+            import re
+            if not dur:
+                return None
+            dur = dur.strip()
+            # Try pure integer seconds first
+            try:
+                return int(dur)
+            except ValueError:
+                pass
+            total = 0
+            m = re.search(r"(\d+)h", dur)
+            if m: total += int(m.group(1)) * 3600
+            m = re.search(r"(\d+)m", dur)
+            if m: total += int(m.group(1)) * 60
+            m = re.search(r"(\d+)s", dur)
+            if m: total += int(m.group(1))
+            return total if total else None
+
+        rl = self._rate_limits
+        for key, header in [
+            ("remaining_tokens",   "x-ratelimit-remaining-tokens"),
+            ("remaining_requests", "x-ratelimit-remaining-requests"),
+            ("limit_tokens",       "x-ratelimit-limit-tokens"),
+            ("limit_requests",     "x-ratelimit-limit-requests"),
+        ]:
+            val = headers.get(header)
+            if val is not None:
+                try:
+                    rl[key] = int(val)
+                except (ValueError, TypeError):
+                    pass
+
+        reset_tok = headers.get("x-ratelimit-reset-tokens")
+        reset_req = headers.get("x-ratelimit-reset-requests")
+        if reset_tok is not None:
+            rl["reset_tokens_sec"] = _parse_duration(reset_tok)
+        if reset_req is not None:
+            rl["reset_requests_sec"] = _parse_duration(reset_req)
+
+        rl["last_updated"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+    def get_rate_limit_info(self) -> dict:
+        """Return a snapshot of the current rate-limit + circuit state for display."""
+        info = dict(self._rate_limits)
+        info["circuit_open"] = self._circuit_is_open()
+        info["provider"]     = self.api_base
+        info["fast_model"]   = self.fast_model
+        return info
+
     async def _complete_once(self, messages: list[dict], max_tokens: int,
                               temperature: float, json_mode: bool,
                               model_override: str = None) -> str:
@@ -117,6 +181,8 @@ class LLMClient:
             headers=headers,
             json=payload,
         )
+        # Capture rate-limit headers regardless of HTTP status
+        self._capture_rate_limits(resp.headers)
         resp.raise_for_status()
         data          = resp.json()
         choice        = data["choices"][0]

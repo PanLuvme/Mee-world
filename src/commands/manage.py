@@ -23,7 +23,7 @@ from src.utils import db, embeds
 from src.utils.embeds import DEFAULT_IMAGE, groq_onboarding_embed
 from src.utils.webhook import get_or_create_webhook
 from src.agents.llm import LLMClient
-from src.agents.vector_store import delete_memories_from_chroma, delete_collection
+from src.agents.vector_store import delete_memories_from_chroma, delete_collection, delete_all_collections
 
 logger = logging.getLogger(__name__)
 
@@ -504,6 +504,110 @@ class CreateMyMeeModal(discord.ui.Modal, title="🌸 Create Your Mee"):
         interaction.client.dispatch("mee_created", mee_id)
 
 
+# ─── Token limits helper ──────────────────────────────────────────────────────
+
+async def _show_token_limits(interaction: discord.Interaction, mee_data: dict):
+    """Show API token / rate-limit usage for this Mee's LLM clients."""
+    agent = interaction.client.agents.get(mee_data["id"])
+    if not agent:
+        await interaction.response.send_message(
+            embed=discord.Embed(description="❌ Agent not loaded — can't fetch token data.", color=0xFF4444),
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title=f"📊 {mee_data['name']} — Token Limits & Rate Status",
+        color=embeds.mee_colour(mee_data["name"]),
+    )
+    embed.set_thumbnail(url=mee_data.get("image_url") or embeds.DEFAULT_IMAGE)
+
+    # ── Background (Groq) API ──────────────────────────────────────────────
+    bg: LLMClient = agent.llm
+    bg_rl = bg.get_rate_limit_info()
+    bg_model = mee_data.get("model", "?")
+    embed.add_field(
+        name=f"🔵 Background ({bg_model})",
+        value=_format_rl_block(bg_rl, bg.api_base),
+        inline=False,
+    )
+
+    # ── Foreground (Gemini) API ────────────────────────────────────────────
+    fg: LLMClient = agent.llm_fg
+    fg_rl = fg.get_rate_limit_info()
+    fg_model = mee_data.get("gemini_model") or "none"
+    has_fg = bool(mee_data.get("gemini_api_key"))
+    if has_fg:
+        embed.add_field(
+            name=f"🟢 Foreground ({fg_model})",
+            value=_format_rl_block(fg_rl, fg.api_base),
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="🟢 Foreground",
+            value="*No foreground (Gemini) key configured.*",
+            inline=False,
+        )
+
+    embed.set_footer(text="Rate limits refresh after each API call")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+def _format_rl_block(rl: dict, api_base: str) -> str:
+    """Format a rate-limit info dict into a short description string."""
+    # Circuit breaker status
+    cb_symbol = "🔴 Open" if rl.get("circuit_open") else "🟢 Closed"
+
+    # Remaining tokens
+    rem_tok = rl.get("remaining_tokens")
+    rem_req = rl.get("remaining_requests")
+    lim_tok = rl.get("limit_tokens")
+    lim_req = rl.get("limit_requests")
+
+    tok_str = f"**{rem_tok:,}**" if rem_tok is not None else "*unknown*"
+    if lim_tok is not None:
+        tok_str += f" / {lim_tok:,}"
+
+    req_str = f"**{rem_req:,}**" if rem_req is not None else "*unknown*"
+    if lim_req is not None:
+        req_str += f" / {lim_req:,}"
+
+    # Reset times → PST
+    reset_tok = rl.get("reset_tokens_sec")
+    reset_req = rl.get("reset_requests_sec")
+
+    lines = [
+        f"**Tokens:** {tok_str} remaining",
+    ]
+    if reset_tok is not None:
+        lines.append(f"⏰ Token reset: **{_pst_time_str(reset_tok)}**")
+    lines.append(f"**Requests:** {req_str} remaining")
+    if reset_req is not None:
+        lines.append(f"⏰ Request reset: **{_pst_time_str(reset_req)}**")
+    lines.append(f"**Circuit:** {cb_symbol}")
+    lines.append(f"📍 `{api_base}`")
+
+    return "\n".join(lines)
+
+
+def _pst_time_str(seconds_from_now: int) -> str:
+    """Convert seconds-from-now to a PST/PDT time string."""
+    from datetime import datetime, timedelta, timezone
+    try:
+        from zoneinfo import ZoneInfo
+        now_pst = datetime.now(ZoneInfo("America/Los_Angeles"))
+        reset   = now_pst + timedelta(seconds=seconds_from_now)
+        return reset.strftime("%I:%M %p %Z").lstrip("0").lower()
+    except ImportError:
+        # Fallback: manual PST (UTC-8)
+        utc_now = datetime.now(timezone.utc)
+        pst_offset = -8  # Standard PST, no DST fallback
+        reset_utc = utc_now + timedelta(seconds=seconds_from_now)
+        reset_pst = reset_utc + timedelta(hours=pst_offset)
+        return reset_pst.strftime("%I:%M %p PST").lstrip("0").lower()
+
+
 # ─── Management views ──────────────────────────────────────────────────────────
 
 class ManageMeeView(discord.ui.View):
@@ -665,7 +769,11 @@ class UserManageMeeView(discord.ui.View):
             view=view, ephemeral=True,
         )
 
-    @discord.ui.button(label="🗑️ Delete", style=discord.ButtonStyle.danger, row=3)
+    @discord.ui.button(label="📊 Token Limits", style=discord.ButtonStyle.grey, row=3)
+    async def token_limits(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _show_token_limits(interaction, self.mee)
+
+    @discord.ui.button(label="�️ Delete", style=discord.ButtonStyle.danger, row=3)
     async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):
         view = ConfirmDeleteView(self.mee)
         await interaction.response.send_message(
@@ -764,6 +872,73 @@ class ConfirmDeleteView(discord.ui.View):
         interaction.client.dispatch("mee_removed", self.mee["id"])
         await interaction.response.edit_message(
             embed=embeds.success_embed(f"**{self.mee['name']}** has been removed."), view=None)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=embeds.success_embed("Cancelled."), view=None)
+
+
+class ConfirmSimulationResetView(discord.ui.View):
+    """Two-step confirmation for wiping ALL Mees' simulation data."""
+    def __init__(self):
+        super().__init__(timeout=30)
+        self.confirmed = False
+
+    @discord.ui.button(label="🔥 YES, wipe everything", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.confirmed:
+            return
+        self.confirmed = True
+
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                description="⏳ Resetting all simulation data...",
+                color=0xFF8800,
+            ), view=None
+        )
+
+        # 1. Wipe all SQLite tables
+        counts = await db.reset_all_simulation_data()
+
+        # 2. Wipe all ChromaDB collections
+        chroma_count = delete_all_collections()
+
+        # 3. Re-send agent instances so they pick up the empty state
+        bot = interaction.client
+        for agent in list(bot.agents.values()):
+            agent._exhausted    = False
+            agent._silent_ticks = 0
+            agent.location      = "the main channel"
+
+        # 4. Post a world update to every active channel
+        mees = await db.list_mees()
+        channels_seen: set[str] = set()
+        for mee in mees:
+            ch_id = mee.get("channel_id")
+            if ch_id and ch_id not in channels_seen:
+                channels_seen.add(ch_id)
+                channel = bot.get_channel(int(ch_id))
+                if channel:
+                    await bot.post_world_update(
+                        "🌅 The world has been reset. All Mees wake up with no memories, "
+                        "no relationships, and a blank slate. A new story begins.",
+                        channel,
+                        event_type="update",
+                    )
+
+        summary = (
+            f"🔥 **Simulation reset complete!**\n\n"
+            f"**SQLite:**\n"
+            + "\n".join(f"• {t}: **{n}** rows deleted" for t, n in sorted(counts.items()) if n)
+            + f"\n\n**ChromaDB:** **{chroma_count}** collections deleted\n"
+            f"**Mees:** **{len(mees)}** character profiles preserved\n"
+            f"**Channels:** **{len(channels_seen)}** world-update notifications sent"
+        )
+        await interaction.followup.send(
+            embed=discord.Embed(description=summary, color=0x00CC88),
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1061,10 +1236,42 @@ class ManageCog(commands.Cog):
                 ),
                 ephemeral=True,
             )
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # /mymee group — ANY USER commands (scoped to their own Mee)
-    # ═══════════════════════════════════════════════════════════════════════════
+    
+        @mee_group.command(
+            name="reset-all",
+            description="⚠️ WIPE ALL simulation data for every Mee (owner only)",
+        )
+        @is_owner()
+        async def mee_reset_all(self, interaction: discord.Interaction):
+            """Delete ALL memories, relationships, plans, conversations, world events,
+            ChromaDB vectors, and every other piece of simulation state for EVERY Mee.
+            Mee character definitions (name, identity, API keys) are preserved."""
+            view = ConfirmSimulationResetView()
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title="⚠️ Reset Entire Simulation?",
+                    description=(
+                        "This will **permanently delete** ALL of the following for **every Mee**:\n\n"
+                        "🧠 All memories (observations, reflections, conversations, plans, recaps)\n"
+                        "💞 All relationships, crushes, confession states\n"
+                        "📋 All plans and agendas\n"
+                        "💬 All conversation history\n"
+                        "🌍 All world events\n"
+                        "📦 All pending addressed messages\n"
+                        "🫀 All needs and shared info\n"
+                        "🔮 All ChromaDB vector embeddings\n\n"
+                        "**Mee character profiles (name, identity, traits, API keys) are preserved.**\n\n"
+                        "This **cannot be undone**."
+                    ),
+                    color=0xFF2222,
+                ),
+                view=view,
+                ephemeral=True,
+            )
+    
+        # ═══════════════════════════════════════════════════════════════════════════
+        # /mymee group — ANY USER commands (scoped to their own Mee)
+        # ═══════════════════════════════════════════════════════════════════════════
 
     mymee_group = app_commands.Group(
         name="mymee",

@@ -107,6 +107,24 @@ def delete_collection(mee_id: int, mee_name: str):
         logger.warning(f"ChromaDB collection delete failed for {mee_name}: {e}")
 
 
+def delete_all_collections():
+    """Delete EVERY ChromaDB collection — used for full simulation reset."""
+    try:
+        client = _get_client()
+        names  = list(client.list_collections())
+        for col in names:
+            try:
+                client.delete_collection(col.name)
+            except Exception:
+                pass
+        _collections.clear()
+        logger.info(f"✅ Deleted all {len(names)} ChromaDB collections")
+        return len(names)
+    except Exception as e:
+        logger.warning(f"Failed to delete all ChromaDB collections: {e}")
+        return 0
+
+
 def query_memories(mee_id: int, mee_name: str, query: str,
                    n_results: int = 30) -> list[dict]:
     """

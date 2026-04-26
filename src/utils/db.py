@@ -423,6 +423,39 @@ async def delete_memories_about_person(mee_id: int, person_name: str) -> list:
         return ids
 
 
+async def reset_all_simulation_data() -> dict[str, int]:
+    """Delete ALL simulation data across ALL Mees (memories, relationships, plans,
+    conversations, world events, queues, needs, shared info).
+
+    Returns a dict of table_name → row_count_deleted.
+    Does NOT delete Mee characters themselves (the ``mees`` table is preserved).
+    """
+    counts: dict[str, int] = {}
+    async with aiosqlite.connect(DB_PATH) as db:
+        tables = [
+            ("memories",        "DELETE FROM memories"),
+            ("relationships",   "DELETE FROM relationships"),
+            ("plans",           "DELETE FROM plans"),
+            ("conversations",   "DELETE FROM conversations"),
+            ("world_state",     "DELETE FROM world_state"),
+            ("addressed_queue", "DELETE FROM addressed_queue"),
+            ("shared_info",     "DELETE FROM shared_info"),
+            ("mee_needs",       "DELETE FROM mee_needs"),
+            ("shared_info",     "DELETE FROM shared_info"),
+        ]
+        for name, sql in tables:
+            cur = await db.execute(sql)
+            counts[name] = cur.rowcount
+        await db.commit()
+    # Reset each Mee's mood & location to defaults
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE mees SET mood = 'neutral', location = 'the main channel', last_tick = NULL"
+        )
+        await db.commit()
+    return counts
+
+
 async def touch_memories(memory_ids: list[int]):
     """Batch UPDATE last_accessed + access_count for a list of memory IDs."""
     if not memory_ids:
