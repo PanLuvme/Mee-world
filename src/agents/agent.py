@@ -92,15 +92,30 @@ def _build_fg_client(mee_data: dict, bg_client: LLMClient) -> LLMClient:
     """Build foreground (quality) client.
 
     Priority:
-    1. Gemini key configured → use Gemini with the Gemini model.
-    2. No Gemini key → use the same Groq API key with a heavier quality model
-       (QUALITY_MODEL env var, default: llama-3.3-70b-versatile).
+    1. Gemini key (AIza prefix) configured → use Gemini with the Gemini model.
+    2. Custom key (non-AIza, e.g. a separate Groq key) → use that key with
+       the stored model on the bg_client's API base (Groq).
+    3. No key configured → use the same Groq API key as the background with
+       QUALITY_MODEL (default: llama-3.3-70b-versatile).
        This eliminates the need for a second API key entirely.
     """
-    gemini_key   = mee_data.get("gemini_api_key") or ""
-    gemini_model = mee_data.get("gemini_model") or "gemini-2.0-flash"
-    if gemini_key:
-        return LLMClient(api_key=gemini_key, model=gemini_model, api_base=GEMINI_API_BASE)
+    fg_key   = mee_data.get("gemini_api_key") or ""
+    fg_model = mee_data.get("gemini_model") or ""
+    if fg_key:
+        # AIza → Gemini (backward compat)
+        if fg_key.startswith("AIza"):
+            return LLMClient(
+                api_key=fg_key,
+                model=fg_model or "gemini-2.0-flash",
+                api_base=GEMINI_API_BASE,
+            )
+        # Non-AIza → treat as a Groq/OpenAI-compat key override
+        return LLMClient(
+            api_key=fg_key,
+            model=fg_model or QUALITY_MODEL,
+            api_base=bg_client.api_base,
+            quality_model=fg_model or QUALITY_MODEL,
+        )
     # All-Groq: foreground uses the quality model on the same Groq key
     return LLMClient(
         api_key=bg_client.api_key,

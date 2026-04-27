@@ -251,16 +251,22 @@ class EditModelModal(discord.ui.Modal, title="🤖 Edit LLM Settings"):
         )
 
 
-class EditForegroundKeyModal(discord.ui.Modal, title="🌟 Foreground Key (Gemini)"):
-    """Set the Google AI Studio API key used for direct user/Mee-to-Mee responses."""
+class EditForegroundKeyModal(discord.ui.Modal, title="🌟 Quality Model Override"):
+    """Set an optional separate key / model for quality (foreground) LLM calls.
+    
+    When empty, the Mee uses the same Groq key as the background model
+    but with the QUALITY_MODEL env var (default: llama-3.3-70b-versatile).
+    You only need to fill this in if you want a *different* Groq key for
+    quality calls, or if you're still using a Gemini key (AIza prefix).
+    """
     fg_key = discord.ui.TextInput(
-        label="Google AI Studio API Key (foreground)",
-        placeholder="AIza... — free at aistudio.google.com — leave blank to clear",
+        label="API Key (optional — leave blank to auto-use your Groq key)",
+        placeholder="gsk_... or AIza... — leave blank to auto-use your Groq key",
         max_length=400, required=False,
     )
     fg_model = discord.ui.TextInput(
-        label="Gemini model (default: gemini-2.0-flash)",
-        placeholder="gemini-2.0-flash",
+        label="Quality model (default: llama-3.3-70b-versatile)",
+        placeholder="llama-3.3-70b-versatile",
         max_length=100, required=False,
     )
 
@@ -268,43 +274,34 @@ class EditForegroundKeyModal(discord.ui.Modal, title="🌟 Foreground Key (Gemin
         super().__init__()
         self.mee_data             = mee_data
         self.fg_key.default       = mee_data.get("gemini_api_key") or ""
-        self.fg_model.default     = mee_data.get("gemini_model") or "gemini-2.0-flash"
+        self.fg_model.default     = mee_data.get("gemini_model") or ""
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         key   = self.fg_key.value.strip()
-        model = self.fg_model.value.strip() or "gemini-2.0-flash"
+        model = self.fg_model.value.strip() or ""
 
         if key:
-            # Validate the Gemini key against the OpenAI-compat endpoint
-            valid = await validate_api_key(key, GEMINI_API_BASE, model)
-            if not valid:
-                await interaction.followup.send(
-                    embed=embeds.error_embed(
-                        "❌ Could not validate the Gemini API key.\n\n"
-                        "• Get a **free** key at [aistudio.google.com](https://aistudio.google.com)\n"
-                        "• The key should start with `AIza`\n"
-                        "• Make sure the Gemini API is enabled in your Google account"
-                    ),
-                    ephemeral=True,
-                )
-                return
-            await db.update_mee(self.mee_data["id"], gemini_api_key=key, gemini_model=model)
+            # Save the override key+model; _build_fg_client() will detect
+            # AIza → Gemini, gsk_ → Groq, anything else → Groq with stored model.
+            await db.update_mee(self.mee_data["id"], gemini_api_key=key, gemini_model=model or None)
+            which = "Gemini" if key.startswith("AIza") else "Groq quality model"
             await interaction.followup.send(
                 embed=embeds.success_embed(
-                    f"✅ **{self.mee_data['name']}** will now use Gemini `{model}` "
-                    f"for direct conversations with users and other Mees.\n"
-                    f"Background/idle chat still uses the Groq key."
+                    f"✅ **{self.mee_data['name']}** quality model key saved.\n"
+                    f"{which} `{model or 'default'}` will be used for "
+                    f"direct conversations with users and other Mees."
                 ),
                 ephemeral=True,
             )
         else:
-            # Clear the foreground key — fall back to Groq for everything
+            # Clear the override — fall back to bg_client's Groq key + QUALITY_MODEL env var
             await db.update_mee(self.mee_data["id"], gemini_api_key=None, gemini_model=None)
             await interaction.followup.send(
                 embed=embeds.success_embed(
-                    f"Foreground key cleared. **{self.mee_data['name']}** "
-                    f"will use the background (Groq) key for all calls."
+                    f"✅ Quality override cleared for **{self.mee_data['name']}**.\n"
+                    f"Will auto-use the background Groq key with the `QUALITY_MODEL` "
+                    f"env var (default: llama-3.3-70b-versatile)."
                 ),
                 ephemeral=True,
             )
