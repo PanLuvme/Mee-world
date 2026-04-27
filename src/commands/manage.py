@@ -102,7 +102,18 @@ async def _check_create_permission(interaction: discord.Interaction) -> bool:
 
 
 async def validate_api_key(api_key: str, api_base: str, model: str) -> bool:
-    """Test an API key with a minimal 1-token completion. Returns True if valid."""
+    """Test an API key with a minimal 1-token completion. Returns True if valid.
+
+    Gemini keys (AIza prefix) are accepted by format-check only — no network
+    call — because a 429 (quota exceeded) is a *valid* key, just rate-limited.
+    Non-Gemini keys (Groq, OpenAI, etc.) are tested with a live 1-token ping.
+    """
+    # Gemini keys: AIza prefix is sufficient validation; skip network call
+    # to avoid false negatives from 429 (quota exceeded) or transient errors.
+    if api_key.startswith("AIza"):
+        return True
+
+    # Non-Gemini keys: network validation ping
     try:
         client = LLMClient(api_key=api_key, model=model, api_base=api_base)
         result = await client.complete(
