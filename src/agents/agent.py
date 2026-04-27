@@ -72,7 +72,8 @@ ACTIVITIES: list[tuple[str, str, int, int]] = [
     ("sipping tea and watching", "☕", 2, 3),
     ("organising their space",   "📦", 3, 5),
 ]
-ACTIVITY_CHANCE = 0.40  # Probability of starting an activity when idle
+ACTIVITY_CHANCE             = 0.40  # Probability of starting an activity when idle
+ACTIVITY_POST_COOLDOWN_SECS = 900   # Min seconds between activity world-updates per agent (15 min)
 
 # ─── Conversation State Machine ─────────────────────────────────────────────────
 # Formal Mee-to-Mee conversation lifecycle with max messages and timeout,
@@ -194,6 +195,7 @@ class MeeAgent:
         self._exhausted_at:     float      = 0.0
         self._silent_ticks:     int        = 0
         self._activity: Optional[dict] = None  # {"desc": str, "emoji": str, "ticks_left": int}
+        self._last_activity_post_time: float = 0.0
         self._conversation_id: Optional[int] = None  # Active conversation ID, if any
         self._v6_agent_id: str | None = None  # UUID in the v6 agents table
 
@@ -1226,13 +1228,22 @@ class MeeAgent:
             # they may start a short flavourful activity for the next tick.
             # The world-update is posted ONCE when the activity starts, not on
             # every subsequent tick (the activity gate skips further posts).
+            # A per-agent cooldown (ACTIVITY_POST_COOLDOWN_SECS) prevents flooding
+            # the world channel — the activity still suppresses exhaustion ticks
+            # internally, but the broadcast is throttled.
             if not forced and not action and not wander_event and not self._exhausted and self._activity is None:
                 if random.random() < ACTIVITY_CHANCE:
                     self._activity = self._pick_activity()
                     logger.info(f"[{self.name}] 🎭 Started activity: {self._activity['emoji']} {self._activity['desc']} ({self._activity['ticks_left']} ticks)")
-                    activity_event = self._activity_event()
-                    if activity_event:
-                        extra_events.append(("activity", activity_event, self))
+                    # Throttle world-update posting — don't broadcast if we posted
+                    # one recently (prevents activity-spam without affecting the
+                    # internal activity state machine).
+                    now_ts_local = time.time()
+                    if now_ts_local - self._last_activity_post_time >= ACTIVITY_POST_COOLDOWN_SECS:
+                        activity_event = self._activity_event()
+                        if activity_event:
+                            extra_events.append(("activity", activity_event, self))
+                            self._last_activity_post_time = now_ts_local
 
 
             if confession_msg:
