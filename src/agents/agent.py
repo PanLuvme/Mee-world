@@ -1,5 +1,6 @@
 """MeeAgent v5 — Tomodachi Life × Smallville × AgentSociety generative agent."""
 
+import asyncio
 import logging
 import os
 import random
@@ -171,6 +172,14 @@ class MeeAgent:
         self.location:    str  = mee_data.get("location") or "the main channel"
         self.mood:        str  = mee_data.get("mood") or "neutral"
 
+        # ── PAD emotional state (Pleasure, Arousal, Dominance) ──────────────────
+        self.pleasure   = float(mee_data.get("pleasure") or 0.0)
+        self.arousal    = float(mee_data.get("arousal") or 0.0)
+        self.dominance  = float(mee_data.get("dominance") or 0.0)
+
+        # ── Interrupt-driven drafting tracker ──────────────────────────────────
+        self._drafting_task: asyncio.Task | None = None
+
         self.llm = LLMClient(api_key=mee_data["api_key"], model=mee_data["model"],
                              api_base=mee_data.get("api_base", "https://api.groq.com/openai/v1"),
                              quality_model=mee_data.get("quality_model"))
@@ -187,6 +196,11 @@ class MeeAgent:
         self._activity: Optional[dict] = None  # {"desc": str, "emoji": str, "ticks_left": int}
         self._conversation_id: Optional[int] = None  # Active conversation ID, if any
 
+
+    @property
+    def is_drafting(self) -> bool:
+        """True while this agent is in the middle of an LLM generation call."""
+        return self._drafting_task is not None and not self._drafting_task.done()
 
     def _budget_ok(self) -> bool:
         """True if within the per-tick LLM call budget."""
@@ -219,6 +233,16 @@ class MeeAgent:
         )
         self._chroma_watermark = watermark
 
+    async def reload_pad(self) -> None:
+        """Reload PAD emotional state from the database (called before generation)."""
+        try:
+            pad = await db.get_pad(self.id)
+            self.pleasure  = float(pad.get("pleasure", 0.0))
+            self.arousal   = float(pad.get("arousal", 0.0))
+            self.dominance = float(pad.get("dominance", 0.0))
+        except Exception:
+            pass  # Keep current values on error
+
     async def reload(self) -> None:
         data = await db.get_mee_by_id(self.id)
         if not data:
@@ -232,6 +256,9 @@ class MeeAgent:
         self.webhook_url = data.get("webhook_url") or ""
         self.location    = data.get("location") or "the main channel"
         self.mood        = data.get("mood") or "neutral"
+        self.pleasure    = float(data.get("pleasure") or 0.0)
+        self.arousal     = float(data.get("arousal") or 0.0)
+        self.dominance   = float(data.get("dominance") or 0.0)
         self.llm = LLMClient(api_key=data["api_key"], model=data["model"],
                              api_base=data.get("api_base", "https://api.groq.com/openai/v1"),
                              quality_model=data.get("quality_model"))
@@ -717,6 +744,9 @@ class MeeAgent:
                              social_target: Optional[str] = None) -> Optional[str]:
         await self._ensure_chroma_synced()
 
+        # Reload latest PAD emotional state (decayed by background loop)
+        await self.reload_pad()
+
         recent_chat       = await db.get_recent_conversations(channel_id, limit=15)
         pending_addressed = await db.pop_addressed(self.id)
         relationships     = await db.get_relationships(self.id)
@@ -787,26 +817,42 @@ class MeeAgent:
         try:
             # Build stop words to prevent LLM from generating other characters' dialogue
             _stop_words = build_stop_words(self.name, all_mee_names) if all_mee_names else None
-            response = await _action_llm.complete(
-                build_action_prompt(
-                    self.name, self.identity, self.traits, self.goals,
-                    mem_contents, plan, recent_chat, relationships,
-                    all_mee_names, world_context, self.location,
-                    pending_addressed=pending_addressed,
-                    mood=self.mood,
-                    social_target=social_target,
-                    maslow_tier=maslow_tier,
-                    need=need,
-                    estranged_from=estranged_from if estranged_from else None,
-                    crush_on=crush_on,
-                    unshared_for=unshared_for if unshared_for else None,
-                    is_sleeping=is_sleeping,
-                ),
-                max_tokens=_max_tokens,
-                temperature=0.9,
-                stop=_stop_words,
-            )
+            pad_state = (self.pleasure, self.arousal, self.dominance)
+
+            # ── Interruptible LLM drafting ────────────────────────────────────
+            # Register current task so on_message can cancel it if a new
+            # relevant message arrives mid-generation.
+            self._drafting_task = asyncio.current_task()
+            try:
+                response = await _action_llm.complete(
+                    build_action_prompt(
+                        self.name, self.identity, self.traits, self.goals,
+                        mem_contents, plan, recent_chat, relationships,
+                        all_mee_names, world_context, self.location,
+                        pending_addressed=pending_addressed,
+                        mood=self.mood,
+                        social_target=social_target,
+                        maslow_tier=maslow_tier,
+                        need=need,
+                        estranged_from=estranged_from if estranged_from else None,
+                        crush_on=crush_on,
+                        unshared_for=unshared_for if unshared_for else None,
+                        is_sleeping=is_sleeping,
+                        pad_state=pad_state,
+                    ),
+                    max_tokens=_max_tokens,
+                    temperature=0.9,
+                    stop=_stop_words,
+                )
+            except asyncio.CancelledError:
+                logger.info(f"[{self.name}] Draft cancelled by interrupt")
+                raise   # Propagate so _guarded_tick can re-draft
+            finally:
+                self._drafting_task = None
+
             self._charge_budget()
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"[{self.name}] Action generation failed: {e}")
             return None

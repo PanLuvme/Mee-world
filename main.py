@@ -68,6 +68,8 @@ class MeeBot(commands.Bot):
         self._tick_semaphore = asyncio.Semaphore(3)
         # Bot-lifetime HTTP session (reused across all webhook posts)
         self._aio_session: aiohttp.ClientSession | None = None
+        # Interrupt queue: agent_id → pending messages that cancelled a draft
+        self._interrupt_queue: dict[int, list[dict]] = {}
 
     async def setup_hook(self):
         os.makedirs(os.path.dirname(db.DB_PATH), exist_ok=True)
@@ -86,10 +88,12 @@ class MeeBot(commands.Bot):
 
         await self.reload_agents()
         self.agent_tick_loop.start()
+        self.pad_decay_loop.start()
 
     async def close(self):
         """Clean shutdown — close HTTP clients before disconnecting."""
         self.agent_tick_loop.cancel()
+        self.pad_decay_loop.cancel()
 
         if self._aio_session and not self._aio_session.closed:
             await self._aio_session.close()
@@ -144,6 +148,20 @@ class MeeBot(commands.Bot):
         except Exception as e:
             logger.error(f"World update post failed: {e}")
 
+    # ─── PAD decay loop ──────────────────────────────────────────────────────
+
+    @tasks.loop(minutes=2)
+    async def pad_decay_loop(self):
+        """Slowly decay all agents' PAD emotional state toward 0.0 over time."""
+        try:
+            await db.decay_all_pad(factor=0.95)
+        except Exception as e:
+            logger.warning(f"PAD decay error: {e}")
+
+    @pad_decay_loop.before_loop
+    async def _before_pad_decay(self):
+        await self.wait_until_ready()
+
     # ─── Agent tick loop ──────────────────────────────────────────────────────
 
     @tasks.loop(minutes=1)
@@ -196,7 +214,44 @@ class MeeBot(commands.Bot):
                              all_mee_names: list[str], all_agents: list):
         """Acquire semaphore before running the tick — limits concurrent ticks to 3."""
         async with self._tick_semaphore:
-            await self._run_agent_tick(agent, channel_id, all_mee_names, all_agents)
+            try:
+                await self._run_agent_tick(agent, channel_id, all_mee_names, all_agents)
+            except asyncio.CancelledError:
+                # Agent's draft was cancelled by a new incoming message.
+                # Re-draft with the interrupt context within the same semaphore.
+                await self._handle_interrupt_redraft(agent, channel_id, all_mee_names, all_agents)
+
+    async def _handle_interrupt_redraft(self, agent: MeeAgent, channel_id: str,
+                                         all_mee_names: list[str], all_agents: list):
+        """Re-draft a response after an interrupt cancelled the in-flight LLM call."""
+        interrupt_msgs = self._interrupt_queue.pop(agent.id, [])
+        if not interrupt_msgs:
+            logger.debug(f"[{agent.name}] Interrupt cancelled but no queued messages — skipping redraft")
+            return
+
+        logger.info(
+            f"[{agent.name}] 🔄 Re-drafting after interrupt "
+            f"({len(interrupt_msgs)} pending message{'s' if len(interrupt_msgs)>1 else ''})"
+        )
+        try:
+            channel = self.get_channel(int(channel_id))
+            if not channel:
+                return
+
+            # Run a forced decide_action so the agent responds with full context
+            action = await agent.decide_action(channel_id, all_mee_names, forced=True)
+            if action:
+                await self.post_mee_message(agent, action, channel)
+                await db.log_conversation(channel_id, agent.name, action,
+                                           is_mee=True, mee_id=agent.id)
+                await add_observation(agent.llm, agent.id, f"I said: \"{action}\"",
+                                       mee_name=agent.name)
+                await db.update_mee(agent.id, last_tick=datetime.now(timezone.utc).isoformat())
+        except asyncio.CancelledError:
+            logger.debug(f"[{agent.name}] Redraft was also cancelled — draining queue")
+            self._interrupt_queue.pop(agent.id, None)
+        except Exception as e:
+            logger.error(f"[{agent.name}] Interrupt redraft error: {e}")
 
     async def _run_agent_tick(self, agent: MeeAgent, channel_id: str,
                                all_mee_names: list[str], all_agents: list = None):
@@ -364,6 +419,26 @@ class MeeBot(commands.Bot):
                 )
 
             is_addressed = agent.name.lower() in content.lower()
+
+            # ── Interrupt-driven drafting ────────────────────────────────────
+            # If the agent is currently mid-LLM-call and the new message
+            # addresses them by name, cancel the in-flight draft and queue a
+            # re-draft that includes the new message context.
+            if is_addressed and agent.is_drafting:
+                logger.info(
+                    f"[{agent.name}] ⚡ Interrupting draft — new message from {author}"
+                )
+                self._interrupt_queue.setdefault(agent.id, []).append({
+                    "author": author,
+                    "content": content,
+                })
+                # Cancel the in-flight LLM call. The CancelledError propagates
+                # to _guarded_tick → _handle_interrupt_redraft, which re-drafts.
+                agent._drafting_task.cancel()
+                # Skip the reactive respond — the re-draft handles it.
+                continue
+
+            # If not drafting, proceed with normal reactive response logic
             react_chance = 0.85 if is_addressed else 0.35
             if random.random() < react_chance:
                 asyncio.create_task(

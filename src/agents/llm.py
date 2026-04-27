@@ -454,7 +454,8 @@ def build_action_prompt(name: str, identity: str, traits: list, goals: list,
                          estranged_from: list[str] = None,
                          crush_on: str = None,
                          unshared_for: dict = None,
-                         is_sleeping: bool = False) -> list[dict]:
+                         is_sleeping: bool = False,
+                         pad_state: tuple[float, float, float] | None = None) -> list[dict]:
     trait_str = ", ".join(traits) if traits else "thoughtful"
     mem_str   = "\n".join(f"- {m}" for m in relevant_memories[:8]) if relevant_memories else "- Nothing surfaced"
     plan_str  = "\n".join(f"- {p}" for p in plan_today[:3]) if plan_today else "- Chat naturally"
@@ -553,7 +554,10 @@ def build_action_prompt(name: str, identity: str, traits: list, goals: list,
             f"Your core identity: {identity}\n"
             f"Your personality traits: {trait_str}\n"
             f"Your current mood: {mood}\n"
-            f"Your motivational state: {maslow_str}\n\n"
+            f"Your motivational state: {maslow_str}\n"
+            f"Your current emotional state — Pleasure: {pad_state[0]:+.2f if pad_state else '0.00'}, "
+            f"Arousal: {pad_state[1]:+.2f if pad_state else '0.00'}, "
+            f"Dominance: {pad_state[2]:+.2f if pad_state else '0.00'}\n\n"
             f"HOW TO WRITE MESSAGES (Discord-natural style):\n"
             f"- MOST of your messages are 1-2 sentences. Short. Punchy. Like real chat.\n"
             f"- Write 3-4 sentences only when you genuinely have more to say.\n"

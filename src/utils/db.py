@@ -94,9 +94,19 @@ async def init_db():
                 owner_discord_id  TEXT    NOT NULL DEFAULT '0',
                 active            INTEGER NOT NULL DEFAULT 1,
                 created_at        TEXT    NOT NULL DEFAULT (datetime('now')),
-                last_tick         TEXT
+                last_tick         TEXT,
+                pleasure          REAL    NOT NULL DEFAULT 0.0,
+                arousal           REAL    NOT NULL DEFAULT 0.0,
+                dominance         REAL    NOT NULL DEFAULT 0.0
             )
         """)
+
+        # ── PAD emotional state columns (v5 addition) ──────────────────────────
+        for col in ("pleasure", "arousal", "dominance"):
+            try:
+                await db.execute(f"ALTER TABLE mees ADD COLUMN {col} REAL NOT NULL DEFAULT 0.0")
+            except Exception:
+                pass  # Column already exists — safe on re-launch
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS memories (
@@ -925,3 +935,50 @@ async def get_in_conversation_ids() -> set[int]:
             ids.add(r[0])
             ids.add(r[1])
         return ids
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PAD Emotional State Engine (Pleasure, Arousal, Dominance)
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def get_pad(mee_id: int) -> dict:
+    """Return PAD emotional state for an agent: {pleasure, arousal, dominance}."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT pleasure, arousal, dominance FROM mees WHERE id = ?",
+            (mee_id,),
+        )
+        row = await cur.fetchone()
+        if row:
+            return dict(row)
+        return {"pleasure": 0.0, "arousal": 0.0, "dominance": 0.0}
+
+
+async def set_pad(mee_id: int, pleasure: float, arousal: float, dominance: float):
+    """Set PAD values for an agent (clamped to -1.0..1.0)."""
+    p = max(-1.0, min(1.0, pleasure))
+    a = max(-1.0, min(1.0, arousal))
+    d = max(-1.0, min(1.0, dominance))
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE mees SET pleasure = ?, arousal = ?, dominance = ? WHERE id = ?",
+            (p, a, d, mee_id),
+        )
+        await db.commit()
+
+
+async def decay_all_pad(factor: float = 0.95):
+    """Exponential decay of every agent's PAD values toward 0.0.
+    
+    Called periodically by the background decay loop in main.py.
+    factor=0.95 → ~50% decay after ~14 loops (~28 min at 2-min intervals).
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(f"""
+            UPDATE mees SET
+                pleasure  = MAX(-1.0, MIN(1.0, pleasure  * ?)),
+                arousal   = MAX(-1.0, MIN(1.0, arousal   * ?)),
+                dominance = MAX(-1.0, MIN(1.0, dominance * ?))
+        """, (factor, factor, factor))
+        await db.commit()
