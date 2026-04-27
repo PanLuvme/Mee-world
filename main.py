@@ -89,11 +89,13 @@ class MeeBot(commands.Bot):
         await self.reload_agents()
         self.agent_tick_loop.start()
         self.pad_decay_loop.start()
+        self.salience_decay_loop.start()
 
     async def close(self):
         """Clean shutdown — close HTTP clients before disconnecting."""
         self.agent_tick_loop.cancel()
         self.pad_decay_loop.cancel()
+        self.salience_decay_loop.cancel()
 
         if self._aio_session and not self._aio_session.closed:
             await self._aio_session.close()
@@ -148,18 +150,53 @@ class MeeBot(commands.Bot):
         except Exception as e:
             logger.error(f"World update post failed: {e}")
 
-    # ─── PAD decay loop ──────────────────────────────────────────────────────
+    # ─── PAD decay loop (v5 + v6) ───────────────────────────────────────────
 
     @tasks.loop(minutes=2)
     async def pad_decay_loop(self):
-        """Slowly decay all agents' PAD emotional state toward 0.0 over time."""
+        """Slowly decay all agents' PAD emotional state toward 0.0 over time.
+        
+        Decays both the v5 `mees` table and v6 `agents` table.
+        Also processes pending interaction events.
+        """
         try:
             await db.decay_all_pad(factor=0.95)
         except Exception as e:
-            logger.warning(f"PAD decay error: {e}")
+            logger.warning(f"v5 PAD decay error: {e}")
+
+        try:
+            await db.decay_v6_agent_pad(factor=0.95)
+        except Exception as e:
+            logger.warning(f"v6 PAD decay error: {e}")
+
+        try:
+            processed, total = await db.process_pending_events(limit=10)
+            if processed:
+                logger.debug(f"Event processor: marked {len(processed)}/{total} events done")
+        except Exception as e:
+            logger.warning(f"Event processor error: {e}")
 
     @pad_decay_loop.before_loop
     async def _before_pad_decay(self):
+        await self.wait_until_ready()
+
+    # ─── Salience decay loop ─────────────────────────────────────────────────
+
+    @tasks.loop(minutes=5)
+    async def salience_decay_loop(self):
+        """Decay memory salience in the v6 memory_streams table.
+        
+        Runs every 5 minutes (slower than PAD because salience changes
+        are less granular). Core memories (base_salience >= 9) decay
+        at a much slower rate.
+        """
+        try:
+            await db.decay_all_salience(factor=0.98, core_factor=0.995)
+        except Exception as e:
+            logger.warning(f"Salience decay error: {e}")
+
+    @salience_decay_loop.before_loop
+    async def _before_salience_decay(self):
         await self.wait_until_ready()
 
     # ─── Agent tick loop ──────────────────────────────────────────────────────

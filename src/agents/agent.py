@@ -195,6 +195,7 @@ class MeeAgent:
         self._silent_ticks:     int        = 0
         self._activity: Optional[dict] = None  # {"desc": str, "emoji": str, "ticks_left": int}
         self._conversation_id: Optional[int] = None  # Active conversation ID, if any
+        self._v6_agent_id: str | None = None  # UUID in the v6 agents table
 
 
     @property
@@ -243,6 +244,28 @@ class MeeAgent:
         except Exception:
             pass  # Keep current values on error
 
+    async def _reconcile_v6_agent(self) -> None:
+        """Ensure a v6 `agents` record exists for this agent.
+        
+        Creates one if missing (matched by name), stores the UUID in
+        self._v6_agent_id for later prompt-state injection.
+        """
+        try:
+            existing = await db.fetch_agent_by_name(self.name)
+            if existing:
+                self._v6_agent_id = existing["id"]
+            else:
+                self._v6_agent_id = await db.create_agent(
+                    name=self.name,
+                    base_persona=self.identity,
+                )
+                logger.info(
+                    f"[{self.name}] Created v6 agent record ({self._v6_agent_id})"
+                )
+        except Exception as e:
+            logger.warning(f"[{self.name}] v6 agent reconcile failed: {e}")
+            self._v6_agent_id = None
+
     async def reload(self) -> None:
         data = await db.get_mee_by_id(self.id)
         if not data:
@@ -251,6 +274,9 @@ class MeeAgent:
         self.identity    = data["identity"]
         self.traits      = data["traits"]
         self.goals       = data["goals"]
+
+        # Reconcile v6 agent record on reload (name may have changed)
+        await self._reconcile_v6_agent()
         self.image_url   = data["image_url"]
         self.channel_id  = data["channel_id"]
         self.webhook_url = data.get("webhook_url") or ""
@@ -819,6 +845,14 @@ class MeeAgent:
             _stop_words = build_stop_words(self.name, all_mee_names) if all_mee_names else None
             pad_state = (self.pleasure, self.arousal, self.dominance)
 
+            # ── Fetch v6 private state for prompt injection ───────────────────
+            v6_private_state = None
+            if self._v6_agent_id:
+                try:
+                    v6_private_state = await db.fetch_agent(self._v6_agent_id)
+                except Exception:
+                    pass  # Non-fatal — prompt injection is additive
+
             # ── Interruptible LLM drafting ────────────────────────────────────
             # Register current task so on_message can cancel it if a new
             # relevant message arrives mid-generation.
@@ -839,6 +873,7 @@ class MeeAgent:
                         unshared_for=unshared_for if unshared_for else None,
                         is_sleeping=is_sleeping,
                         pad_state=pad_state,
+                        v6_private_state=v6_private_state,
                     ),
                     max_tokens=_max_tokens,
                     temperature=0.9,

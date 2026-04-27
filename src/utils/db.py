@@ -14,6 +14,7 @@ import aiosqlite
 import json
 import logging
 import os
+import uuid
 from datetime import datetime
 from typing import Optional
 
@@ -227,6 +228,83 @@ async def init_db():
                 max_messages    INTEGER NOT NULL DEFAULT 8,
                 last_spoke_by   INTEGER DEFAULT NULL
             )
+        """)
+
+        # ──────────────────────────────────────────────────────────────────────────
+        # v6 Schema: Emotionally persistent, event-driven multi-agent layer
+        # Adapted for SQLite (UUIDs stored as TEXT, JSONB as TEXT, REAL for decimals)
+        #───────────────────────────────────────────────────────────────────────────
+
+        # 1. Core Agent State
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS agents (
+                id                TEXT    PRIMARY KEY,
+                name              TEXT    NOT NULL,
+                base_persona      TEXT    NOT NULL,
+                pleasure          REAL    DEFAULT 0.00,
+                arousal           REAL    DEFAULT 0.00,
+                dominance         REAL    DEFAULT 0.00,
+                current_activity  TEXT    DEFAULT 'Idle',
+                created_at        TEXT    DEFAULT (datetime('now')),
+                updated_at        TEXT    DEFAULT (datetime('now'))
+            )
+        """)
+
+        # 2. Agent Relationships (Social Influence)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS agent_relationships (
+                id                 TEXT PRIMARY KEY,
+                source_agent_id    TEXT REFERENCES agents(id) ON DELETE CASCADE,
+                target_agent_id    TEXT REFERENCES agents(id) ON DELETE CASCADE,
+                trust              REAL DEFAULT 0.00,
+                fear               REAL DEFAULT 0.00,
+                admiration         REAL DEFAULT 0.00,
+                rivalry            REAL DEFAULT 0.00,
+                last_interaction_at TEXT,
+                UNIQUE(source_agent_id, target_agent_id)
+            )
+        """)
+
+        # 3. Memory Streams (Reflection & Emotional Scarring)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS memory_streams (
+                id                 TEXT PRIMARY KEY,
+                agent_id           TEXT REFERENCES agents(id) ON DELETE CASCADE,
+                memory_type        TEXT NOT NULL,
+                content            TEXT NOT NULL,
+                base_salience      INTEGER CHECK (base_salience BETWEEN 1 AND 10),
+                current_salience   REAL,
+                pad_impact_snapshot TEXT,
+                created_at         TEXT DEFAULT (datetime('now')),
+                last_accessed_at   TEXT DEFAULT (datetime('now'))
+            )
+        """)
+
+        # 4. Event Ledger (Async Triggers)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS interaction_events (
+                id              TEXT PRIMARY KEY,
+                initiator_id    TEXT,
+                target_id       TEXT REFERENCES agents(id),
+                event_type      TEXT NOT NULL,
+                event_payload   TEXT,
+                processed       INTEGER DEFAULT 0,
+                created_at      TEXT DEFAULT (datetime('now'))
+            )
+        """)
+
+        # v6 indexes
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_agent_relationships_source
+            ON agent_relationships(source_agent_id)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memory_streams_agent_type
+            ON memory_streams(agent_id, memory_type)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_interaction_events_unprocessed
+            ON interaction_events(processed) WHERE processed = 0
         """)
 
 # Migrations for existing databases
@@ -982,3 +1060,332 @@ async def decay_all_pad(factor: float = 0.95):
                 dominance = MAX(-1.0, MIN(1.0, dominance * ?))
         """, (factor, factor, factor))
         await db.commit()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# v6 Schema — Emotionally Persistent Multi-Agent Layer
+# These tables / functions supplement (not replace) the existing mees/memories
+# schema. UUIDs are generated in Python; timestamps stored as ISO-8601 TEXT.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ─── 1. Core Agent State ──────────────────────────────────────────────────
+
+async def create_agent(name: str, base_persona: str) -> str:
+    """Create a new v6 agent. Returns the agent's UUID."""
+    agent_id = str(uuid.uuid4())
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO agents (id, name, base_persona) VALUES (?, ?, ?)",
+            (agent_id, name, base_persona),
+        )
+        await db.commit()
+    return agent_id
+
+
+async def fetch_agent(agent_id: str) -> Optional[dict]:
+    """Fetch a v6 agent by UUID. Returns None if not found."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM agents WHERE id = ?", (agent_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def fetch_agent_by_name(name: str) -> Optional[dict]:
+    """Fetch a v6 agent by name. Returns None if not found."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM agents WHERE name = ?", (name,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def update_agent_pad(agent_id: str, pleasure: float, arousal: float, dominance: float):
+    """Set PAD values for a v6 agent (clamped to -1.0..1.0)."""
+    p = max(-1.0, min(1.0, pleasure))
+    a = max(-1.0, min(1.0, arousal))
+    d = max(-1.0, min(1.0, dominance))
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE agents SET pleasure = ?, arousal = ?, dominance = ?, updated_at = datetime('now') WHERE id = ?",
+            (p, a, d, agent_id),
+        )
+        await db.commit()
+
+
+async def update_agent_activity(agent_id: str, activity: str):
+    """Set the current_activity for a v6 agent."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE agents SET current_activity = ?, updated_at = datetime('now') WHERE id = ?",
+            (activity, agent_id),
+        )
+        await db.commit()
+
+
+async def list_all_agents() -> list[dict]:
+    """Return all v6 agents."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM agents ORDER BY created_at")
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+# ─── 2. Agent Relationships (Social Influence) ─────────────────────────────
+
+async def upsert_agent_rel(
+    source_agent_id: str, target_agent_id: str,
+    trust: float = 0.0, fear: float = 0.0,
+    admiration: float = 0.0, rivalry: float = 0.0,
+):
+    """Insert or update a relationship between two v6 agents."""
+    rel_id = str(uuid.uuid4())
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO agent_relationships
+               (id, source_agent_id, target_agent_id, trust, fear, admiration, rivalry, last_interaction_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+               ON CONFLICT(source_agent_id, target_agent_id) DO UPDATE SET
+                   trust             = ?,
+                   fear              = ?,
+                   admiration        = ?,
+                   rivalry           = ?,
+                   last_interaction_at = datetime('now')""",
+            (rel_id, source_agent_id, target_agent_id,
+             trust, fear, admiration, rivalry,
+             trust, fear, admiration, rivalry),
+        )
+        await db.commit()
+
+
+async def fetch_agent_relationships(agent_id: str) -> list[dict]:
+    """Return all relationships for a v6 agent (as source or target)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT * FROM agent_relationships
+               WHERE source_agent_id = ? OR target_agent_id = ?
+               ORDER BY last_interaction_at DESC""",
+            (agent_id, agent_id),
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def fetch_agent_relationship(source_agent_id: str, target_agent_id: str) -> Optional[dict]:
+    """Return the relationship between two v6 agents, if any."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT * FROM agent_relationships
+               WHERE source_agent_id = ? AND target_agent_id = ?""",
+            (source_agent_id, target_agent_id),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+# ─── 3. Memory Streams (Reflection & Emotional Scarring) ───────────────────
+
+async def insert_memory_stream(
+    agent_id: str, memory_type: str, content: str,
+    base_salience: int, pad_snapshot: Optional[dict] = None,
+) -> str:
+    """Add a memory to a v6 agent's memory stream. Returns the memory UUID."""
+    mem_id = str(uuid.uuid4())
+    snapshot_json = json.dumps(pad_snapshot) if pad_snapshot else None
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO memory_streams
+               (id, agent_id, memory_type, content, base_salience, current_salience, pad_impact_snapshot)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (mem_id, agent_id, memory_type, content, base_salience, float(base_salience), snapshot_json),
+        )
+        await db.commit()
+    return mem_id
+
+
+async def fetch_memory_streams(
+    agent_id: str, memory_type: Optional[str] = None, limit: int = 50,
+) -> list[dict]:
+    """Fetch memories for a v6 agent, optionally filtered by type."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if memory_type:
+            cur = await db.execute(
+                """SELECT * FROM memory_streams
+                   WHERE agent_id = ? AND memory_type = ?
+                   ORDER BY created_at DESC LIMIT ?""",
+                (agent_id, memory_type, limit),
+            )
+        else:
+            cur = await db.execute(
+                """SELECT * FROM memory_streams
+                   WHERE agent_id = ?
+                   ORDER BY created_at DESC LIMIT ?""",
+                (agent_id, limit),
+            )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def fetch_high_salience_streams(agent_id: str, min_salience: int = 7) -> list[dict]:
+    """Fetch core / scar memories (base_salience >= threshold)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT * FROM memory_streams
+               WHERE agent_id = ? AND base_salience >= ?
+               ORDER BY base_salience DESC, created_at DESC""",
+            (agent_id, min_salience),
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def update_stream_salience(stream_id: str, new_salience: float):
+    """Update current_salience for a memory stream entry."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE memory_streams SET current_salience = ? WHERE id = ?",
+            (new_salience, stream_id),
+        )
+        await db.commit()
+
+
+async def touch_memory_stream(stream_id: str):
+    """Update last_accessed_at to now for a memory stream entry."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE memory_streams SET last_accessed_at = datetime('now') WHERE id = ?",
+            (stream_id,),
+        )
+        await db.commit()
+
+
+# ─── 4. Interaction Events (Async Trigger Ledger) ──────────────────────────
+
+async def push_interaction_event(
+    initiator_id: str, target_id: Optional[str],
+    event_type: str, payload: Optional[dict] = None,
+) -> str:
+    """Enqueue an interaction event for async processing. Returns the event UUID."""
+    event_id = str(uuid.uuid4())
+    payload_json = json.dumps(payload) if payload else "{}"
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO interaction_events
+               (id, initiator_id, target_id, event_type, event_payload)
+               VALUES (?, ?, ?, ?, ?)""",
+            (event_id, initiator_id, target_id, event_type, payload_json),
+        )
+        await db.commit()
+    return event_id
+
+
+async def fetch_unprocessed_events(limit: int = 50) -> list[dict]:
+    """Return unprocessed interaction events, oldest first."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT * FROM interaction_events
+               WHERE processed = 0
+               ORDER BY created_at ASC LIMIT ?""",
+            (limit,),
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def mark_event_done(event_id: str):
+    """Mark an interaction event as processed."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE interaction_events SET processed = 1 WHERE id = ?",
+            (event_id,),
+        )
+        await db.commit()
+
+
+# ─── Phase 2: Decay & Update Loop Functions ────────────────────────────────
+
+
+async def decay_v6_agent_pad(factor: float = 0.95):
+    """Exponential decay of v6 agents table PAD values toward 0.0.
+    
+    Each cycle: new_value = old_value * factor
+    Default factor 0.95 = 5% decay per cycle (runs every 2 minutes).
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """UPDATE agents SET
+               pleasure   = ROUND(pleasure   * ?, 4),
+               arousal    = ROUND(arousal    * ?, 4),
+               dominance  = ROUND(dominance  * ?, 4),
+               updated_at = datetime('now')
+               WHERE pleasure != 0 OR arousal != 0 OR dominance != 0""",
+            (factor, factor, factor),
+        )
+        await db.commit()
+
+
+async def decay_all_salience(factor: float = 0.98, core_factor: float = 0.995):
+    """Decay current_salience for all memory_streams entries.
+    
+    Two-tier decay:
+    - base_salience >= 9 (core memories/scars): decays much slower (core_factor)
+    - base_salience < 9 (ordinary memories): decays at normal rate (factor)
+    
+    Salience never goes below 0.5 so it stays retrievable.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Ordinary memories: decay toward 0.5
+        await db.execute(
+            """UPDATE memory_streams SET
+               current_salience = MAX(0.5, ROUND(current_salience * ?, 4))
+               WHERE base_salience < 9 AND current_salience > 0.5""",
+            (factor,),
+        )
+        # Core memories (base_salience 9-10): decay much slower
+        await db.execute(
+            """UPDATE memory_streams SET
+               current_salience = MAX(0.5, ROUND(current_salience * ?, 4))
+               WHERE base_salience >= 9 AND current_salience > 0.5""",
+            (core_factor,),
+        )
+        await db.commit()
+
+
+async def process_pending_events(limit: int = 10):
+    """Event processor: handle unprocessed interaction_events.
+    
+    Currently a placeholder that marks events as processed.
+    In future phases, this will trigger side-effects like
+    relationship updates, memory formation, or world events.
+    """
+    events = await fetch_unprocessed_events(limit=limit)
+    if not events:
+        return [], 0
+
+    processed_ids = []
+    for ev in events:
+        # ── Placeholder: log and mark done ──────────────────────────────────
+        logger = getattr(process_pending_events, "_logger", None)
+        if logger is None:
+            import logging
+            logger = logging.getLogger("event_processor")
+            process_pending_events._logger = logger
+
+        logger.debug(
+            "Processing event %s — type=%s initiator=%s target=%s",
+            ev["id"], ev["event_type"], ev["initiator_id"], ev["target_id"],
+        )
+
+        # Future: dispatch to relationship_update / memory_formation / world_event
+        # based on ev["event_type"]
+
+        await mark_event_done(ev["id"])
+        processed_ids.append(ev["id"])
+
+    return processed_ids, len(events)
