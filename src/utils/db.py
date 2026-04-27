@@ -458,7 +458,6 @@ async def reset_all_simulation_data() -> dict[str, int]:
             ("addressed_queue", "DELETE FROM addressed_queue"),
             ("shared_info",     "DELETE FROM shared_info"),
             ("mee_needs",       "DELETE FROM mee_needs"),
-            ("shared_info",     "DELETE FROM shared_info"),
         ]
         for name, sql in tables:
             cur = await db.execute(sql)
