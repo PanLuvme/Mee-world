@@ -364,7 +364,7 @@ class MeeBot(commands.Bot):
                 )
 
             is_addressed = agent.name.lower() in content.lower()
-            react_chance = 0.7 if is_addressed else 0.25
+            react_chance = 0.85 if is_addressed else 0.35
             if random.random() < react_chance:
                 asyncio.create_task(
                     self._maybe_reactive_respond(agent, channel_id, all_mee_names)

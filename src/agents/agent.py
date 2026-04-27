@@ -39,7 +39,7 @@ from src.utils import db
 
 logger = logging.getLogger(__name__)
 
-MAX_CALLS_PER_TICK         = int(os.getenv("MAX_CALLS_PER_TICK", "8"))
+MAX_CALLS_PER_TICK         = int(os.getenv("MAX_CALLS_PER_TICK", "14"))
 SLEEP_HOUR_START           = int(os.getenv("SLEEP_HOUR_START", "23"))
 SLEEP_HOUR_END             = int(os.getenv("SLEEP_HOUR_END", "7"))
 WANDER_COOLDOWN_MINUTES    = int(os.getenv("WANDER_COOLDOWN_MINUTES", "30"))
@@ -266,7 +266,7 @@ class MeeAgent:
         """Two-stage reflection (~3-5 LLM calls); charge budget accordingly."""
         reflections = await maybe_reflect(self.llm, self.id, self.name, all_mee_names)
         if reflections:
-            self._charge_budget(min(5, len(reflections) + 2))
+            self._charge_budget(min(3, len(reflections) + 1))
         return reflections
 
     async def check_tier_transition(self, other_name: str) -> str | None:
@@ -680,8 +680,8 @@ class MeeAgent:
             return random.random() < 0.05   # 5% chance even while sleeping
         human_recent = any(not m.get("is_mee") for m in recent_chat[-5:])
         if human_recent:
-            return random.random() < 0.60
-        return random.random() < 0.40
+            return random.random() < 0.80   # 80% chance to react when humans are present
+        return random.random() < 0.50       # 50% chance for spontaneous speech
 
     async def decide_action(self, channel_id: str, all_mee_names: list[str],
                              forced: bool = False,
@@ -955,8 +955,10 @@ class MeeAgent:
                 await self.maybe_surface_need()
 
             # ── Activity gate ───────────────────────────────────────────────
-            # If the agent is mid-activity and the tick isn't forced, the agent
-            # stays busy rather than wandering, socialising, or generating new action.
+            # If the agent is mid-activity, post the flavour event but DO NOT
+            # skip the gated phase — agents can still wander, socialise, and
+            # generate actions while doing an activity. Activities are cosmetic
+            # overlays, not tick replacements.
             if not forced and self._activity is not None:
                 self._activity["ticks_left"] -= 1
                 if self._activity["ticks_left"] > 0:
@@ -964,8 +966,6 @@ class MeeAgent:
                     activity_event = self._activity_event()
                     if activity_event:
                         extra_events.append(("activity", activity_event, self))
-                    # Return early — skip gated phase entirely
-                    return None, None, extra_events
                 else:
                     # Activity expired — clear it and proceed to gated phase
                     self._activity = None
