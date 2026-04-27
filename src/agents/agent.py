@@ -44,6 +44,7 @@ SLEEP_HOUR_START           = int(os.getenv("SLEEP_HOUR_START", "23"))
 SLEEP_HOUR_END             = int(os.getenv("SLEEP_HOUR_END", "7"))
 WANDER_COOLDOWN_MINUTES    = int(os.getenv("WANDER_COOLDOWN_MINUTES", "30"))
 EXHAUSTION_WAKE_MINUTES    = int(os.getenv("EXHAUSTION_WAKE_MINUTES", "5"))
+QUALITY_MODEL              = os.getenv("QUALITY_MODEL", "llama-3.3-70b-versatile").strip()
 
 DEFAULT_LOCATIONS = ["the café", "the park", "the library", "the rooftop", "their room",
                      "the garden", "the couch", "the balcony", "the kitchen", "the town square"]
@@ -88,12 +89,25 @@ _SENTIMENT_KEYWORDS = frozenset({
 
 
 def _build_fg_client(mee_data: dict, bg_client: LLMClient) -> LLMClient:
-    """Build Gemini foreground client; falls back to Groq if no Gemini key configured."""
+    """Build foreground (quality) client.
+
+    Priority:
+    1. Gemini key configured → use Gemini with the Gemini model.
+    2. No Gemini key → use the same Groq API key with a heavier quality model
+       (QUALITY_MODEL env var, default: llama-3.3-70b-versatile).
+       This eliminates the need for a second API key entirely.
+    """
     gemini_key   = mee_data.get("gemini_api_key") or ""
     gemini_model = mee_data.get("gemini_model") or "gemini-2.0-flash"
-    if not gemini_key:
-        return bg_client
-    return LLMClient(api_key=gemini_key, model=gemini_model, api_base=GEMINI_API_BASE)
+    if gemini_key:
+        return LLMClient(api_key=gemini_key, model=gemini_model, api_base=GEMINI_API_BASE)
+    # All-Groq: foreground uses the quality model on the same Groq key
+    return LLMClient(
+        api_key=bg_client.api_key,
+        model=QUALITY_MODEL,
+        api_base=bg_client.api_base,
+        quality_model=QUALITY_MODEL,
+    )
 
 
 def _day_rhythm_factor(hour: int) -> float:

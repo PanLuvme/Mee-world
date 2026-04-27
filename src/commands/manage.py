@@ -1248,41 +1248,41 @@ class ManageCog(commands.Cog):
                 ephemeral=True,
             )
     
-        @mee_group.command(
-            name="reset-all",
-            description="⚠️ WIPE ALL simulation data for every Mee (owner only)",
-        )
-        @is_owner()
-        async def mee_reset_all(self, interaction: discord.Interaction):
-            """Delete ALL memories, relationships, plans, conversations, world events,
-            ChromaDB vectors, and every other piece of simulation state for EVERY Mee.
-            Mee character definitions (name, identity, API keys) are preserved."""
-            view = ConfirmSimulationResetView()
-            await interaction.response.send_message(
-                embed=discord.Embed(
-                    title="⚠️ Reset Entire Simulation?",
-                    description=(
-                        "This will **permanently delete** ALL of the following for **every Mee**:\n\n"
-                        "🧠 All memories (observations, reflections, conversations, plans, recaps)\n"
-                        "💞 All relationships, crushes, confession states\n"
-                        "📋 All plans and agendas\n"
-                        "💬 All conversation history\n"
-                        "🌍 All world events\n"
-                        "📦 All pending addressed messages\n"
-                        "🫀 All needs and shared info\n"
-                        "🔮 All ChromaDB vector embeddings\n\n"
-                        "**Mee character profiles (name, identity, traits, API keys) are preserved.**\n\n"
-                        "This **cannot be undone**."
-                    ),
-                    color=0xFF2222,
+    @mee_group.command(
+        name="reset-all",
+        description="⚠️ WIPE ALL simulation data for every Mee (owner only)",
+    )
+    @is_owner()
+    async def mee_reset_all(self, interaction: discord.Interaction):
+        """Delete ALL memories, relationships, plans, conversations, world events,
+        ChromaDB vectors, and every other piece of simulation state for EVERY Mee.
+        Mee character definitions (name, identity, API keys) are preserved."""
+        view = ConfirmSimulationResetView()
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="⚠️ Reset Entire Simulation?",
+                description=(
+                    "This will **permanently delete** ALL of the following for **every Mee**:\n\n"
+                    "🧠 All memories (observations, reflections, conversations, plans, recaps)\n"
+                    "💞 All relationships, crushes, confession states\n"
+                    "📋 All plans and agendas\n"
+                    "💬 All conversation history\n"
+                    "🌍 All world events\n"
+                    "📦 All pending addressed messages\n"
+                    "🫀 All needs and shared info\n"
+                    "🔮 All ChromaDB vector embeddings\n\n"
+                    "**Mee character profiles (name, identity, traits, API keys) are preserved.**\n\n"
+                    "This **cannot be undone**."
                 ),
-                view=view,
-                ephemeral=True,
-            )
-    
-        # ═══════════════════════════════════════════════════════════════════════════
-        # /mymee group — ANY USER commands (scoped to their own Mee)
-        # ═══════════════════════════════════════════════════════════════════════════
+                color=0xFF2222,
+            ),
+            view=view,
+            ephemeral=True,
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # /mymee group — ANY USER commands (scoped to their own Mee)
+    # ═══════════════════════════════════════════════════════════════════════════
 
     mymee_group = app_commands.Group(
         name="mymee",
