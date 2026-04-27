@@ -1154,6 +1154,37 @@ class MeeAgent:
                 if intro_msg:
                     extra_events.append(("intro", intro_msg, self))
 
+            # ── Rate-limit / circuit-breaker gate ────────────────────────────
+            # If the LLM client's circuit breaker is open (rate-limited, out of
+            # tokens), don't wander, socialize, generate actions, or start
+            # activities. Instead, post a single world-update and immediately
+            # mark the agent as exhausted. They'll auto-wake once the circuit
+            # heals (default 5 min circuit breaker + 8 min exhaustion sleep).
+            if not forced:
+                try:
+                    _llm_circuit_open  = self.llm._circuit_is_open
+                    _fg_circuit_open   = self.llm_fg._circuit_is_open
+                except Exception:
+                    _llm_circuit_open = _fg_circuit_open = False
+
+                if _llm_circuit_open or _fg_circuit_open:
+                    if not self._exhausted:
+                        self._exhausted    = True
+                        self._exhausted_at = time.time()
+                        logger.info(
+                            f"[{self.name}] 🔇 Circuit breaker open — "
+                            f"exhausted until rate limits reset"
+                        )
+                        extra_events.append((
+                            "exhausted",
+                            f"💤 {self.name} has run out of tokens and fallen asleep. "
+                            f"They'll be back once their rate limits reset!",
+                            self
+                        ))
+                    # Return early: no wander, no social initiative, no action,
+                    # no activities — agent is fully asleep until limits recover.
+                    return None, None, extra_events
+
             # ── Gated phase: wander, social, action ──────────────────────────
             # If mid-conversation: skip wander, use partner as social target.
             # Otherwise: normal wander + social initiative (filter out conversing agents).
