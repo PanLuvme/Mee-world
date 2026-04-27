@@ -260,12 +260,12 @@ class EditForegroundKeyModal(discord.ui.Modal, title="🌟 Quality Model Overrid
     quality calls, or if you're still using a Gemini key (AIza prefix).
     """
     fg_key = discord.ui.TextInput(
-        label="API Key (optional — leave blank to auto-use your Groq key)",
+        label="API Key (optional)",
         placeholder="gsk_... or AIza... — leave blank to auto-use your Groq key",
         max_length=400, required=False,
     )
     fg_model = discord.ui.TextInput(
-        label="Quality model (default: llama-3.3-70b-versatile)",
+        label="Quality model (optional)",
         placeholder="llama-3.3-70b-versatile",
         max_length=100, required=False,
     )
