@@ -44,7 +44,7 @@ MAX_CALLS_PER_TICK         = int(os.getenv("MAX_CALLS_PER_TICK", "14"))
 SLEEP_HOUR_START           = int(os.getenv("SLEEP_HOUR_START", "23"))
 SLEEP_HOUR_END             = int(os.getenv("SLEEP_HOUR_END", "7"))
 WANDER_COOLDOWN_MINUTES    = int(os.getenv("WANDER_COOLDOWN_MINUTES", "30"))
-EXHAUSTION_WAKE_MINUTES    = int(os.getenv("EXHAUSTION_WAKE_MINUTES", "5"))
+EXHAUSTION_WAKE_MINUTES    = int(os.getenv("EXHAUSTION_WAKE_MINUTES", "8"))
 QUALITY_MODEL              = os.getenv("QUALITY_MODEL", "llama-3.3-70b-versatile").strip()
 
 DEFAULT_LOCATIONS = ["the café", "the park", "the library", "the rooftop", "their room",
@@ -1065,17 +1065,15 @@ class MeeAgent:
                 await self.maybe_surface_need()
 
             # ── Activity gate ───────────────────────────────────────────────
-            # If the agent is mid-activity, post the flavour event but DO NOT
-            # skip the gated phase — agents can still wander, socialise, and
-            # generate actions while doing an activity. Activities are cosmetic
-            # overlays, not tick replacements.
+            # If the agent is mid-activity, count ticks but do NOT spam
+            # world-updates. The activity world-update was already posted once
+            # when the activity started (see activity-start block below).
+            # Activities are cosmetic overlays, NOT tick replacements — the
+            # agent can still wander, socialise, and generate actions.
             if not forced and self._activity is not None:
                 self._activity["ticks_left"] -= 1
                 if self._activity["ticks_left"] > 0:
                     self._silent_ticks = 0  # activity counts as 'doing something'
-                    activity_event = self._activity_event()
-                    if activity_event:
-                        extra_events.append(("activity", activity_event, self))
                 else:
                     # Activity expired — clear it and proceed to gated phase
                     self._activity = None
@@ -1209,7 +1207,7 @@ class MeeAgent:
                     )
             else:
                 self._silent_ticks += 1
-                if self._silent_ticks >= 3 and not self._exhausted:
+                if self._silent_ticks >= 10 and not self._exhausted:
                     self._exhausted    = True
                     self._exhausted_at = now_ts
                     extra_events.append(
@@ -1226,10 +1224,15 @@ class MeeAgent:
             # ── Activity start (idle ticks only) ────────────────────────────
             # If the agent produced no action, didn't wander, and isn't exhausted,
             # they may start a short flavourful activity for the next tick.
+            # The world-update is posted ONCE when the activity starts, not on
+            # every subsequent tick (the activity gate skips further posts).
             if not forced and not action and not wander_event and not self._exhausted and self._activity is None:
                 if random.random() < ACTIVITY_CHANCE:
                     self._activity = self._pick_activity()
                     logger.info(f"[{self.name}] 🎭 Started activity: {self._activity['emoji']} {self._activity['desc']} ({self._activity['ticks_left']} ticks)")
+                    activity_event = self._activity_event()
+                    if activity_event:
+                        extra_events.append(("activity", activity_event, self))
 
 
             if confession_msg:
